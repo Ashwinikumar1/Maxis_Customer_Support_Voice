@@ -1,0 +1,17 @@
+# Secrets - never commit
+.env
+**/.env
+archive/legacy_sophie/test.py
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local transcript fallback (when GCS_BUCKET is unset)
+transcripts/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

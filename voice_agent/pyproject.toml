@@ -1,0 +1,21 @@
+[project]
+name = "voice-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "certifi>=2026.7.22",
+    "google-adk>=2.0,<3",
+    "google-cloud-storage>=3.17.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.36",
+    "opentelemetry-resourcedetector-gcp>=1.9.0a0,<2",
+    "python-dotenv>=1.2.4",
+    "websockets>=15",
+]
+
+[dependency-groups]
+dev = [
+    "adk-voice",
+]
+
+[tool.uv.sources]
+adk-voice = { path = "../../../.gemini/config/plugins/adk-voice-pack/runtime", editable = true }

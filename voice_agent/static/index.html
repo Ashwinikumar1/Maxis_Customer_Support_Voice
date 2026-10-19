@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Voice Agent</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot" id="statusDot"></span>
+      <h1>Live Voice Agent</h1>
+      <span class="pill" id="agentPill">offline</span>
+    </div>
+    <div class="controls">
+      <span id="statusText">Not connected</span>
+      <button id="micBtn" class="primary">Start talking</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel transcript-panel">
+      <h2>Transcript</h2>
+      <div id="transcript" class="transcript"></div>
+      <form id="textForm" class="text-form">
+        <input id="textInput" type="text" maxlength="2000" autocomplete="off"
+               placeholder="Or type a message (English / Bahasa Melayu)…" disabled />
+        <button type="submit" id="sendBtn" disabled>Send</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Activity</h2>
+      <ul id="activity" class="activity"></ul>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
