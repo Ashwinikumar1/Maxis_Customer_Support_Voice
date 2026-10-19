@@ -6,6 +6,7 @@
 __pycache__/
 *.pyc
 .venv/
+~/
 
 # Local transcript fallback (when GCS_BUCKET is unset)
 transcripts/

@@ -11,11 +11,3 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "websockets>=15",
 ]
-
-[dependency-groups]
-dev = [
-    "adk-voice",
-]
-
-[tool.uv.sources]
-adk-voice = { path = "../../../.gemini/config/plugins/adk-voice-pack/runtime", editable = true }

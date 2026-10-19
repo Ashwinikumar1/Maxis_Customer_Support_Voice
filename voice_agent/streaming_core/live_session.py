@@ -1,11 +1,11 @@
-"""Channel-agnostic Gemini Live session (the core loop of streaming_service.py).
+"""Channel-agnostic Gemini Live session.
 
 The server feeds client input in (`send_audio` / `send_text`) and receives
 everything the model does through one async callback `emit(type, **data)`:
 
   audio(data=pcm16_24k) transcript(role, text, partial, author)
   tool_call(name, args, author) tool_result(name, response, author)
-  search(queries, sources) active_agent(name) interrupted() turn_complete(state)
+  active_agent(name) interrupted() turn_complete(state)
 
 Today the browser WebSocket uses it; a telephony gateway (e.g. Genesys) can
 reuse it later by writing its own `emit` + audio conversion.
@@ -218,20 +218,6 @@ class LiveVoiceSession:
           self.transcript.add_turn(speaker, tr.text, agent=None if role == "user" else author)
           if role == "user":
             turn.start(current_agent or "")  # user finished speaking: the clock starts
-
-    # --- Google Search grounding: the built-in search runs inside Gemini, so
-    # we learn about it from grounding_metadata (queries + source links), not
-    # from a function call. Only https links are passed on.
-    meta = event.grounding_metadata
-    if meta and (meta.web_search_queries or meta.grounding_chunks):
-      queries = list(meta.web_search_queries or [])[:5]
-      sources = [
-          {"title": (c.web.title or c.web.domain or "source")[:120], "uri": c.web.uri}
-          for c in (meta.grounding_chunks or [])
-          if c.web and c.web.uri and c.web.uri.startswith("https://")
-      ][:5]
-      await emit("search", queries=queries, sources=sources)
-      self.transcript.add_event("google_search", queries=queries)
 
     turn.usage(event.usage_metadata)
 

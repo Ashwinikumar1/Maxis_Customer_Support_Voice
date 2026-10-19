@@ -51,12 +51,12 @@
     return wrap;
   }
 
-  function onTranscript({ role, text, partial, author }) {
+  function onTranscript({ role, text, partial }) {
     // A new speaker closes the other speaker's open bubble.
     closeBubble(role === "user" ? "agent" : "user");
     let bubble = openBubble[role];
     if (!bubble) {
-      const label = role === "user" ? "You" : prettyAgent(author);
+      const label = role === "user" ? "You" : "Assistant";
       bubble = openBubble[role] = newBubble(role, label);
     }
     const body = bubble.querySelector(".body");
@@ -69,7 +69,7 @@
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
   }
 
-  function addActivity(kind, text, links) {
+  function addActivity(kind, text) {
     const li = document.createElement("li");
     const tag = document.createElement("span");
     tag.className = "tag " + kind;
@@ -77,21 +77,8 @@
     const span = document.createElement("span");
     span.textContent = " " + text;
     li.append(tag, span);
-    for (const link of links || []) {
-      if (typeof link.uri !== "string" || !link.uri.startsWith("https://")) continue;
-      const a = document.createElement("a");
-      a.href = link.uri;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.textContent = link.title;
-      li.append(document.createElement("br"), a);
-    }
     activityEl.prepend(li);
     while (activityEl.children.length > 50) activityEl.lastChild.remove();
-  }
-
-  function prettyAgent(name) {
-    return name === "directions_agent" ? "Directions agent" : "Assistant";
   }
 
   // ---------- Server events ----------
@@ -119,17 +106,11 @@
         break;
       case "tool_result": {
         const r = msg.response || {};
-        if (msg.name === "get_directions" && r.status === "success") {
-          addActivity("route", `${r.origin} → ${r.destination}: ${r.distance_km} km, ` +
-            `${r.duration_minutes} min (${r.travel_mode}) via ${r.via || "—"}`);
-        } else if (msg.name !== "transfer_to_agent") {
-          addActivity("tool", `${msg.name} → ${r.status || "done"}`);
+        if (msg.name !== "transfer_to_agent") {
+          addActivity("tool", `${msg.name} → ${r.status || (r.error ? "error" : "done")}`);
         }
         break;
       }
-      case "search":
-        addActivity("search", (msg.queries || []).join(" | ") || "Google Search", msg.sources);
-        break;
       case "interrupted":
         if (playerNode) playerNode.port.postMessage({ command: "clear" });
         closeBubble("agent");

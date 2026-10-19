@@ -1,4 +1,4 @@
-"""Bidi-streaming voice server (inspired by streaming_service.py).
+"""Bidi-streaming voice server.
 
 One WebSocket per conversation at ws://HOST:PORT/ws; the browser UI is served
 on the same port. Transcript is dumped to GCS when the session ends.
@@ -8,7 +8,7 @@ client -> server : {"type":"init","timezone"} {"type":"audio","data":b64 PCM16 1
 server -> client : {"type":"ready"} {"type":"audio","data":b64 PCM16 24k}
                    {"type":"transcript","role","text","partial","author"}
                    {"type":"tool_call","name","args","author"} {"type":"active_agent","name"}
-                   {"type":"tool_result","name","response","author"} {"type":"search","queries","sources"}
+                   {"type":"tool_result","name","response","author"}
                    {"type":"interrupted"} {"type":"turn_complete","state"} {"type":"error"}
 
 Run:  uv run python server.py   ->  http://127.0.0.1:8080
@@ -166,7 +166,7 @@ async def handle_client(websocket):
 async def _handle_client(websocket):
   client_id = uuid.uuid4().hex  # random, unguessable id for this connection
   send = lambda payload: websocket.send(json.dumps(payload))  # noqa: E731
-  await send({"type": "ready"})  # same handshake as streaming_service.py
+  await send({"type": "ready"})
 
   # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone.
   # The timezone drives the greeting and the date/time injected into the prompt.

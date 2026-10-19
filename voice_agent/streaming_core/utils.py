@@ -1,4 +1,4 @@
-"""Small helpers (ported from streaming_service.py)."""
+"""Small helpers: audio sample rates, logger, timezone-aware date info."""
 
 import logging
 import os

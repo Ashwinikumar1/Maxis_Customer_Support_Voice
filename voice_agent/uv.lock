@@ -8,31 +8,6 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "adk-voice"
-source = { editable = "../../../.gemini/config/plugins/adk-voice-pack/runtime" }
-dependencies = [
-    { name = "certifi" },
-    { name = "fastapi" },
-    { name = "google-adk" },
-    { name = "python-dotenv" },
-    { name = "uvicorn" },
-    { name = "websockets" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "certifi" },
-    { name = "fastapi", specifier = ">=0.110" },
-    { name = "google-adk", specifier = ">=2.0,<3" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "uvicorn", specifier = ">=0.30" },
-    { name = "websockets", specifier = ">=12" },
-]
-provides-extras = ["dev"]
-
-[[package]]
 name = "aiosqlite"
 version = "0.22.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1256,11 +1231,6 @@ dependencies = [
     { name = "websockets" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "adk-voice" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2026.7.22" },
@@ -1271,9 +1241,6 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.2.4" },
     { name = "websockets", specifier = ">=15" },
 ]
-
-[package.metadata.requires-dev]
-dev = [{ name = "adk-voice", editable = "../../../.gemini/config/plugins/adk-voice-pack/runtime" }]
 
 [[package]]
 name = "watchdog"
