@@ -1,7 +1,6 @@
 # Secrets - never commit
 .env
 **/.env
-archive/legacy_sophie/test.py
 
 # Python
 __pycache__/
