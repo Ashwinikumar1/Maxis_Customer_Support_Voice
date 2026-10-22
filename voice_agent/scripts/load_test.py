@@ -139,7 +139,7 @@ def _stats(values: list[float]) -> str:
 
 async def main() -> int:
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--url", required=True, help="service URL, e.g. https://maxis-voice-agent-123.us-central1.run.app")
+  parser.add_argument("--url", required=True, help="service URL, e.g. https://maxis-voice-agent-123.asia-southeast1.run.app")
   parser.add_argument("--calls", type=int, default=5, help="number of simultaneous simulated callers")
   parser.add_argument("--ramp", type=float, default=10, help="seconds over which the calls are started")
   parser.add_argument("--duration", type=float, default=60, help="seconds each call stays open")
