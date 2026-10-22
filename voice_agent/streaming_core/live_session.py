@@ -77,6 +77,109 @@ def default_run_config(voice_name: str) -> RunConfig:
       ),
   )
 
+# [Observability #12] Tokens used per call, recorded once when the call ends.
+# One histogram sample per call and per token type, so Cloud Monitoring can
+# show both the distribution (p50 / p95 tokens per call) and the sum (total
+# tokens across all calls) - the basis for cost per call.
+_call_tokens = _meter.create_histogram(
+    "voice.call.tokens", unit="{token}",
+    description="Tokens used by one call, by type (input / output / total). "
+                "Recorded at the end of the call from the Live API's usage reports.")
+
+
+class _CallTokenUsage:
+  """[Observability #12] Running token totals for ONE call.
+
+  WHY THIS IS CODE AND NOT A GOOGLE CLOUD SETTING (checked before writing)
+    - ADK's own token metric (gen_ai.client.token.usage) is NOT recorded for
+      live voice calls: in ADK 2.12 only the text request path
+      (flows/llm_flows/core) calls the token telemetry; google/adk/live/ never
+      does. For this agent that metric stays empty.
+    - Vertex AI publishes aiplatform.googleapis.com/publisher/online_serving/
+      token_count in Cloud Monitoring, but only as project-wide totals per
+      model (by input/output and modality) - it cannot say which CALL used
+      the tokens. https://docs.cloud.google.com/monitoring/api/metrics_gcp_a_b
+    So a per-call figure has to be built here, from the token reports the
+    Live API sends during the call.
+
+  WHAT THE LIVE API SENDS - AND WHY WE DO NOT SIMPLY ADD THE REPORTS UP
+    Each usage report is "a report of the number of tokens used by the
+    session so far" - a RUNNING TOTAL, not the tokens of one message.
+    https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/models/live-api
+    Adding the reports together would count the early part of the call again
+    with every new report and grossly overstate usage. The correct per-call
+    figure is the LATEST report. ADK passes each report through unchanged:
+    google/adk/models/gemini_llm_connection.py turns it into an event, and
+    flows/llm_flows/core/_finalizer.py copies usage_metadata onto that event.
+
+  THE ONE CASE THE DOCS DO NOT COVER: A COUNTER RESTART
+    Gemini Live connections last about 10 minutes, and ADK reconnects long
+    calls using session resumption. The docs do not say whether the running
+    total continues or starts again from zero on the new connection. So if a
+    report is ever LOWER than the previous one, we treat it as a restart: the
+    previous connection's last figures are kept ("carried") and the new
+    running total is added on top. If the counter never restarts, this branch
+    simply never runs. `counter_resets` records how often it happened, so a
+    real call can show which behaviour Gemini actually has.
+
+  WHAT IS COUNTED (names from the API, mapped to plain keys)
+    input            prompt_token_count   - everything the model read (caller
+                                            audio, system prompt, history, ...)
+    output           candidates_token_count - what the model produced (speech)
+    thoughts         thoughts_token_count - internal reasoning, if any
+    tool_use_prompt  tool_use_prompt_token_count - tool results fed back in
+    cached           cached_content_token_count - input served from cache
+    total            total_token_count    - the API's own total
+    input.<MODALITY> / output.<MODALITY>  - the same split by AUDIO / TEXT /
+                                            ...: Google prices audio and text
+                                            tokens differently, so cost needs it
+  """
+
+  _FIELDS = {
+      "input": "prompt_token_count",
+      "output": "candidates_token_count",
+      "thoughts": "thoughts_token_count",
+      "tool_use_prompt": "tool_use_prompt_token_count",
+      "cached": "cached_content_token_count",
+      "total": "total_token_count",
+  }
+  _DETAILS = {"input": "prompt_tokens_details", "output": "candidates_tokens_details"}
+
+  def __init__(self):
+    self.reports = 0         # usage reports received during the call
+    self.counter_resets = 0  # times the running total started again (see above)
+    self._latest = {}        # the most recent report, as plain keys
+    self._carried = {}       # final figures of earlier connections, if any restart happened
+
+  @classmethod
+  def _flatten(cls, usage) -> dict:
+    """One usage report -> {"input": n, "output": n, ..., "input.AUDIO": n, ...}."""
+    values = {key: getattr(usage, field, None) or 0 for key, field in cls._FIELDS.items()}
+    for key, field in cls._DETAILS.items():
+      for detail in getattr(usage, field, None) or []:
+        modality = getattr(getattr(detail, "modality", None), "value", None) or "UNSPECIFIED"
+        values[f"{key}.{modality}"] = values.get(f"{key}.{modality}", 0) + (detail.token_count or 0)
+    if not values["total"]:  # some reports may omit the total: rebuild it from its parts
+      values["total"] = values["input"] + values["output"] + values["thoughts"] + values["tool_use_prompt"]
+    return values
+
+  def update(self, usage) -> None:
+    """Takes one running-total report from the Live API."""
+    values = self._flatten(usage)
+    if self._latest and values["total"] < self._latest["total"]:
+      # The running total went DOWN: the counter restarted (see class docstring).
+      for key, value in self._latest.items():
+        self._carried[key] = self._carried.get(key, 0) + value
+      self.counter_resets += 1
+    self._latest = values
+    self.reports += 1
+
+  def totals(self) -> dict:
+    """Tokens used by the call so far: latest report + anything carried over."""
+    keys = set(self._latest) | set(self._carried)
+    return {key: self._carried.get(key, 0) + self._latest.get(key, 0) for key in sorted(keys)}
+
+
 class _TurnTracker:
   """One OTel span per model reply ("model_turn"), plus voice latency metrics.
 
@@ -107,12 +210,16 @@ class _TurnTracker:
   # Turns where a real person is waiting - the only ones whose wait is measured.
   _USER_TRIGGERS = ("user_speech", "user_text")
 
-  def __init__(self, session_id: str):
+  def __init__(self, session_id: str, tokens: "_CallTokenUsage | None" = None):
     self.session_id = session_id
     self.span = None
     self.start_ns = 0
     self.got_audio = False
     self.trigger = "model"
+    # [#12] The call's token totals, and their value when this turn started:
+    # the difference is what this turn used (see usage()).
+    self.tokens = tokens
+    self.tokens_at_start = {}
 
   def start(self, agent: str = "", trigger: str = "model"):
     # [#5] `trigger` is fixed by whoever opens the turn FIRST. If the agent has
@@ -123,6 +230,7 @@ class _TurnTracker:
       self.start_ns = time.time_ns()
       self.got_audio = False
       self.trigger = trigger
+      self.tokens_at_start = self.tokens.totals() if self.tokens else {}  # [#12] baseline for this turn
       self.span = _tracer.start_span("model_turn", start_time=self.start_ns, attributes={
           "session.id": self.session_id, "gen_ai.agent.name": agent, "voice.turn_trigger": trigger})
 
@@ -146,12 +254,25 @@ class _TurnTracker:
     if self.span is not None:
       self.span.add_event(name, attrs)
 
-  def usage(self, usage):
-    if self.span is not None and usage:
-      if usage.prompt_token_count:
-        self.span.set_attribute("gen_ai.usage.input_tokens", usage.prompt_token_count)
-      if usage.candidates_token_count:
-        self.span.set_attribute("gen_ai.usage.output_tokens", usage.candidates_token_count)
+  def usage(self):
+    """[#12] Tokens used during THIS turn, on the turn's span.
+
+    WHAT CHANGED AND WHY: the old code copied each usage report straight onto
+    the turn as gen_ai.usage.input_tokens / output_tokens. Because the Live
+    API reports a RUNNING TOTAL for the whole session (see _CallTokenUsage),
+    the tenth turn of a call showed the tokens of all ten turns - wrong, and
+    misleading for anyone comparing turns. Now the turn shows the increase
+    since it started: call totals now minus call totals at turn start.
+    Limitation: a report that arrives after the turn has ended is counted in
+    the next turn. The per-call total is not affected by this.
+    """
+    if self.span is None or self.tokens is None:
+      return
+    now = self.tokens.totals()
+    for key, attribute in (("input", "gen_ai.usage.input_tokens"), ("output", "gen_ai.usage.output_tokens")):
+      used = now.get(key, 0) - self.tokens_at_start.get(key, 0)
+      if used > 0:
+        self.span.set_attribute(attribute, used)
 
   def end(self, outcome: str):
     if self.span is not None:
@@ -174,8 +295,30 @@ class LiveVoiceSession:
     # LiveRequestQueue = the "inbox" for the model. Anything put here is streamed
     # to Gemini Live by run_live(). A NEW queue per conversation (never reuse).
     self.queue = LiveRequestQueue()
-    self.turn = _TurnTracker(session_id)  # OTel: one "model_turn" span per reply
+    self.tokens = _CallTokenUsage()       # [#12] token totals for this call
+    self.turn = _TurnTracker(session_id, self.tokens)  # OTel: one "model_turn" span per reply
     self.resumption_updates = 0           # Live API session resumption updates seen
+    self._tokens_recorded = False         # [#12] the per-call metric is recorded once
+
+  def record_token_usage(self) -> dict:
+    """[Observability #12] Final token totals of this call; records the metric once.
+
+    Called by server.py when the call ends, BEFORE the transcript is saved, so
+    the same figures go to the call's trace, its closing log line, its
+    transcript and the voice.call.tokens metric - one number, everywhere.
+    Returns {} when the Live API sent no usage report (e.g. the call failed
+    before the model answered): recording zeros would wrongly pull the
+    tokens-per-call average down, so nothing is recorded in that case.
+    """
+    if not self.tokens.reports:
+      return {}
+    totals = {**self.tokens.totals(), "reports": self.tokens.reports,
+              "counter_resets": self.tokens.counter_resets}
+    if not self._tokens_recorded:
+      self._tokens_recorded = True
+      for kind in ("input", "output", "total"):
+        _call_tokens.record(totals.get(kind, 0), {"type": kind})
+    return totals
 
   # ===========================================================================
   # Client -> model (called by the server's upstream task)
@@ -266,7 +409,11 @@ class LiveVoiceSession:
           if role == "user":
             turn.start(current_agent or "", trigger="user_speech")  # user finished speaking: the clock starts
 
-    turn.usage(event.usage_metadata)
+    # --- [#12] Token usage. The Live API reports the session's RUNNING total;
+    # _CallTokenUsage keeps the call's figures, the turn records its share.
+    if event.usage_metadata:
+      self.tokens.update(event.usage_metadata)
+      turn.usage()
 
     # --- [Observability #10] Live API session resumption.
     # BACKGROUND: one connection to the Gemini Live API lasts only about 10

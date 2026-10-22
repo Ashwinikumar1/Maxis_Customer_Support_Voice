@@ -401,6 +401,17 @@ async def _handle_client(websocket):
     for task in tasks:
       task.cancel()
     session.close()
+    # [Observability #12] Token usage of this call, taken ONCE here and used
+    # everywhere: the transcript (saved next, so it must be set first), the
+    # call's span and the closing log line below, and the voice.call.tokens
+    # metric (recorded inside record_token_usage).
+    # WHY: Google Cloud only reports tokens as project-wide totals per model,
+    # and ADK records no token metric for live voice calls, so without this
+    # there is no way to tell what an individual call consumed - e.g. which
+    # calls are unusually expensive, or what an average call costs.
+    # {} when the Live API sent no usage report (e.g. the call failed first).
+    tokens = session.record_token_usage()
+    transcript.set_metadata("token_usage", tokens or None)
     await transcript.save()  # dump once per session
     await websocket.close()
     # [#9c] One summary per call: reason, length, and how much input was
@@ -413,9 +424,15 @@ async def _handle_client(websocket):
         "voice.close_reason": close_reason,
         "voice.dropped.invalid_audio": dropped["invalid_audio"],
         "voice.dropped.invalid_message": dropped["invalid_message"],
+        # [#12] e.g. voice.tokens.input, voice.tokens.output, voice.tokens.total,
+        # voice.tokens.input.AUDIO - filterable per call in Trace Explorer.
+        **{f"voice.tokens.{key}": value for key, value in tokens.items()},
     })
-    logger.info("Session %s closed (reason=%s, duration=%.1fs, invalid_audio=%d, invalid_messages=%d)",
-                session_id, close_reason, duration_s, dropped["invalid_audio"], dropped["invalid_message"])
+    # [#12] Tokens are in the same closing line; "n/a" means no usage report arrived.
+    logger.info("Session %s closed (reason=%s, duration=%.1fs, invalid_audio=%d, invalid_messages=%d, "
+                "tokens_in=%s, tokens_out=%s, tokens_total=%s)",
+                session_id, close_reason, duration_s, dropped["invalid_audio"], dropped["invalid_message"],
+                tokens.get("input", "n/a"), tokens.get("output", "n/a"), tokens.get("total", "n/a"))
 
 
 # =============================================================================

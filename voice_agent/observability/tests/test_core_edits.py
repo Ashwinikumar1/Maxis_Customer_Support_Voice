@@ -5,6 +5,7 @@
 #8a streaming_core/gcs_logger.py    GCS upload failure logged with the full exception
 #10 streaming_core/live_session.py  Live API session resumption updates on the call span
     observability/logs.py           resumption handle redacted from ADK's log line
+#12 streaming_core/live_session.py  per-call token totals from the Live API running totals
 
 (#3b, #8a trace_id and #9c are covered in test_units.py and test_launcher.py.)
 Run from voice_agent/:  uv run python -m unittest discover -s observability/tests -t .
@@ -116,6 +117,89 @@ class TranscriptUploadFailureTests(unittest.TestCase):  # 8a
     self.assertIn("PermissionError", record.getMessage())
     self.assertIsNotNone(record.exc_info, "full exception + traceback, not just the type name")
     self.assertEqual(transcript.data["metadata"]["trace_id"], TRACE)
+
+
+def _usage(prompt, output, audio_in=None, audio_out=None, total=None):
+  """A Live API usage report as ADK hands it to us (a running total)."""
+  return types.GenerateContentResponseUsageMetadata(
+      prompt_token_count=prompt, candidates_token_count=output,
+      total_token_count=prompt + output if total is None else total,
+      prompt_tokens_details=[types.ModalityTokenCount(modality=types.MediaModality.AUDIO, token_count=audio_in)]
+      if audio_in is not None else None,
+      candidates_tokens_details=[types.ModalityTokenCount(modality=types.MediaModality.AUDIO, token_count=audio_out)]
+      if audio_out is not None else None)
+
+
+class CallTokenUsageTests(unittest.TestCase):  # 12
+
+  def test_running_totals_are_not_added_up(self):
+    from streaming_core.live_session import _CallTokenUsage
+
+    tokens = _CallTokenUsage()
+    for prompt, output in ((100, 20), (250, 45), (400, 70)):  # "tokens used by the session so far"
+      tokens.update(_usage(prompt, output))
+    totals = tokens.totals()
+    self.assertEqual((totals["input"], totals["output"], totals["total"]), (400, 70, 470))  # latest, not 750/135
+    self.assertEqual(tokens.reports, 3)
+    self.assertEqual(tokens.counter_resets, 0)
+
+  def test_counter_restart_is_carried_forward(self):
+    from streaming_core.live_session import _CallTokenUsage
+
+    tokens = _CallTokenUsage()
+    tokens.update(_usage(400, 70))   # first connection ends at 470
+    tokens.update(_usage(50, 10))    # new connection: running total starts again
+    tokens.update(_usage(120, 30))
+    totals = tokens.totals()
+    self.assertEqual((totals["input"], totals["output"], totals["total"]), (520, 100, 620))
+    self.assertEqual(tokens.counter_resets, 1)
+
+  def test_modality_breakdown_and_missing_total(self):
+    from streaming_core.live_session import _CallTokenUsage
+
+    tokens = _CallTokenUsage()
+    tokens.update(_usage(300, 80, audio_in=260, audio_out=80, total=0))
+    totals = tokens.totals()
+    self.assertEqual(totals["input.AUDIO"], 260)
+    self.assertEqual(totals["output.AUDIO"], 80)
+    self.assertEqual(totals["total"], 380)  # rebuilt from its parts when the report omits it
+
+  def test_each_turn_shows_only_its_own_tokens(self):
+    session = LiveVoiceSession(runner=None, user_id="u", session_id="s", run_config=None,
+                               transcript=TranscriptLogger("s"))
+
+    async def emit(*_, **__):
+      pass
+
+    EXPORTER.clear()
+    for prompt, output in ((100, 20), (250, 45)):  # two turns, running totals
+      session.turn.start("maxis_agent", trigger="user_speech")
+      asyncio.run(session._handle(Event(author="maxis_agent", usage_metadata=_usage(prompt, output)),
+                                  emit, session.turn, "maxis_agent"))
+      session.turn.end("idle")
+    first, second = [s for s in EXPORTER.get_finished_spans() if s.name == "model_turn"][-2:]
+    self.assertEqual((first.attributes["gen_ai.usage.input_tokens"], first.attributes["gen_ai.usage.output_tokens"]),
+                     (100, 20))
+    self.assertEqual((second.attributes["gen_ai.usage.input_tokens"], second.attributes["gen_ai.usage.output_tokens"]),
+                     (150, 25))  # the increase, not the running total 250 / 45
+
+  def test_record_token_usage_once_and_empty_without_reports(self):
+    session = LiveVoiceSession(runner=None, user_id="u", session_id="s", run_config=None,
+                               transcript=TranscriptLogger("s"))
+    self.assertEqual(session.record_token_usage(), {})  # no report: nothing recorded, no zeros
+    before = sum(p.count for p in _metric_points("voice.call.tokens"))
+    session.tokens.update(_usage(400, 70))
+    totals = session.record_token_usage()
+    session.record_token_usage()  # a second call must not record again
+    self.assertEqual((totals["input"], totals["output"], totals["total"], totals["reports"]), (400, 70, 470, 1))
+    self.assertEqual(sum(p.count for p in _metric_points("voice.call.tokens")) - before, 3)  # input, output, total
+
+  def test_transcript_metadata(self):
+    transcript = TranscriptLogger("s")
+    transcript.set_metadata("token_usage", {"input": 400})
+    transcript.set_metadata("ignored", None)
+    self.assertEqual(transcript.data["metadata"]["token_usage"], {"input": 400})
+    self.assertNotIn("ignored", transcript.data["metadata"])
 
 
 class LiveApiResumptionTests(unittest.TestCase):  # 10

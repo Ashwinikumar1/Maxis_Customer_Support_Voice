@@ -43,6 +43,16 @@ class TranscriptLogger:
         entry["agent"] = agent
       self.data["conversation"].append(entry)
 
+  def set_metadata(self, key: str, value):
+    """Adds one entry to the transcript's metadata (written when save() runs).
+
+    [Observability #12] Used at the end of a call to store its token usage,
+    so whoever reads a transcript (QA, cost review) sees what that call
+    consumed without searching the metrics. Skips None, like __init__ does.
+    """
+    if value is not None:
+      self.data["metadata"][key] = value
+
   def add_event(self, event: str, **details):
     self.data["conversation"].append({"speaker": "System", "event": event, **details, "timestamp": _now()})
 
