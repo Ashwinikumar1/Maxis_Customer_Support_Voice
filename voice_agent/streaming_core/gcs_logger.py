@@ -58,7 +58,9 @@ class TranscriptLogger:
         logger.info("Transcript saved to gs://%s/%s", self.bucket, self.object_name)
         return
       except Exception as e:
-        logger.error("GCS upload failed (%s) - saving transcript locally instead", type(e).__name__)
+        # exc_info: full cause + traceback in the log (not just the exception type).
+        logger.error("GCS upload failed (%s) - saving transcript locally instead",
+                     type(e).__name__, exc_info=True)
     try:
       path = Path("transcripts") / Path(self.object_name).name
       path.parent.mkdir(exist_ok=True)

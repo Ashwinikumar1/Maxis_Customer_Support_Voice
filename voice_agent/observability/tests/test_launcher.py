@@ -23,6 +23,7 @@ import urllib.request
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parents[2]
+CLOUD_RUN_TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"  # trace id of the (simulated) Cloud Run request
 
 
 def _free_port() -> int:
@@ -54,12 +55,18 @@ class LauncherEndToEnd(unittest.TestCase):
       async def call_then_sigterm():
         from websockets.asyncio.client import connect
 
-        async with connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}") as ws:
+        async with connect(f"ws://127.0.0.1:{port}/ws", origin=f"http://127.0.0.1:{port}",
+                           additional_headers={"traceparent": f"00-{CLOUD_RUN_TRACE}-00f067aa0ba902b7-01"}) as ws:
           await ws.send(json.dumps({"type": "init", "timezone": "Asia/Kuala_Lumpur"}))
           async with asyncio.timeout(10):
             async for raw in ws:
               if json.loads(raw).get("type") == "active_agent":
                 break
+          # Input the server must drop - and now count (#9c).
+          await ws.send("not json")
+          await ws.send(json.dumps({"type": "audio", "data": "%%% not base64 %%%"}))
+          await ws.send(json.dumps({"type": "audio", "data": "%%% not base64 %%%"}))
+          await asyncio.sleep(0.3)
           proc.send_signal(signal.SIGTERM)
           try:
             async with asyncio.timeout(10):
@@ -78,9 +85,27 @@ class LauncherEndToEnd(unittest.TestCase):
     self.assertLess(elapsed, 10)
     messages = [json.loads(l)["message"] for l in out.splitlines() if l.startswith("{")]
     self.assertTrue(any(m.startswith("Transcript saved") for m in messages), "in-flight transcript saved")
-    self.assertTrue(any(m.startswith("Session ") and m.endswith(" closed") for m in messages))
-    names = [json.loads(l)["name"] for l in spans_file.read_text().splitlines()]
-    self.assertIn("voice_session", names, "in-flight call's root span ended and exported")
+    # #9c: close reason and dropped-input counts in the closing log line; first drop warned once.
+    closed = [m for m in messages if m.startswith("Session ") and " closed (" in m]
+    self.assertTrue(closed, messages)
+    self.assertIn("reason=server_shutdown", closed[0])
+    self.assertIn("invalid_audio=2", closed[0])
+    self.assertIn("invalid_messages=1", closed[0])
+    self.assertEqual(sum("dropped an oversized or invalid base64 audio frame" in m for m in messages), 1)
+    spans = [json.loads(l) for l in spans_file.read_text().splitlines()]
+    session = next(s for s in spans if s["name"] == "voice_session")
+    self.assertEqual(session["attributes"]["voice.close_reason"], "server_shutdown")
+    self.assertEqual(session["attributes"]["voice.dropped.invalid_audio"], 2)
+    # #6: the call trace links to the Cloud Run request trace instead of joining it.
+    self.assertEqual(session["links"], [CLOUD_RUN_TRACE])
+    self.assertNotEqual(session["trace_id"], CLOUD_RUN_TRACE)
+    # #8a: the transcript carries the call's trace id.
+    saved = next(m for m in messages if m.startswith("Transcript saved locally to "))
+    transcript_path = APP_DIR / saved.removeprefix("Transcript saved locally to ")
+    try:
+      self.assertEqual(json.loads(transcript_path.read_text())["metadata"]["trace_id"], session["trace_id"])
+    finally:
+      transcript_path.unlink(missing_ok=True)
 
   def test_session_error_403_and_sigterm(self):
     port = _free_port()
@@ -118,6 +143,7 @@ class LauncherEndToEnd(unittest.TestCase):
     failed = [e for e in entries if "failed" in e["message"] and e["severity"] == "ERROR"]
     if failed:  # the Live API call failed (no credentials): the trace must say so too
       self.assertEqual(sessions[0]["status"], "ERROR")
+      self.assertEqual(sessions[0]["attributes"]["voice.close_reason"], "error")
 
   @staticmethod
   def _wait_up(port):

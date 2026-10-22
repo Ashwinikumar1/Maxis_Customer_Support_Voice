@@ -24,7 +24,7 @@ from google.genai import types
 from opentelemetry import metrics, trace
 
 from .gcs_logger import TranscriptLogger
-from .utils import SEND_SAMPLE_RATE
+from .utils import SEND_SAMPLE_RATE, logger
 
 MAX_TEXT_LEN = 2000  # cap typed messages so a client can't flood the model
 
@@ -34,7 +34,8 @@ _tracer = trace.get_tracer("maxis_voice_agent.live")
 _meter = metrics.get_meter("maxis_voice_agent.live")
 _ttfa = _meter.create_histogram(
     "voice.time_to_first_audio", unit="ms",
-    description="User stops speaking (or turn starts) -> first model audio chunk")
+    description="Final user transcript (or typed text) received -> first model audio chunk. "
+                "Model-initiated turns (greeting, continuation after a tool) are not recorded.")
 _turns = _meter.create_counter("voice.model_turns", description="Model turns by outcome")
 
 
@@ -70,31 +71,40 @@ def default_run_config(voice_name: str) -> RunConfig:
 class _TurnTracker:
   """One OTel span per model reply ("model_turn"), plus voice latency metrics.
 
-  The turn starts when the user's speech is final (or, for the greeting / typed
-  text, at the first model output) and ends on turn_complete or barge-in.
+  The turn starts when the user's speech is final, when typed text is sent, or
+  (greeting, continuation after a tool) at the first model output, and ends on
+  turn_complete or barge-in. `trigger` records which: only user-triggered
+  turns have a real start time, so only they feed voice.time_to_first_audio.
   """
+
+  _USER_TRIGGERS = ("user_speech", "user_text")
 
   def __init__(self, session_id: str):
     self.session_id = session_id
     self.span = None
     self.start_ns = 0
     self.got_audio = False
+    self.trigger = "model"
 
-  def start(self, agent: str = ""):
+  def start(self, agent: str = "", trigger: str = "model"):
     if self.span is None:
       self.start_ns = time.time_ns()
       self.got_audio = False
+      self.trigger = trigger
       self.span = _tracer.start_span("model_turn", start_time=self.start_ns, attributes={
-          "session.id": self.session_id, "gen_ai.agent.name": agent})
+          "session.id": self.session_id, "gen_ai.agent.name": agent, "voice.turn_trigger": trigger})
 
   def first_audio(self, agent: str):
     self.start(agent)
     if not self.got_audio:
       self.got_audio = True
-      ms = (time.time_ns() - self.start_ns) / 1e6
-      self.span.set_attribute("voice.time_to_first_audio_ms", round(ms))
       self.span.add_event("first_audio")
-      _ttfa.record(ms, {"agent": agent})
+      # A model-initiated turn starts AT its first output, so its latency would
+      # read ~0 ms and drag the histogram down: record user-triggered turns only.
+      if self.trigger in self._USER_TRIGGERS:
+        ms = (time.time_ns() - self.start_ns) / 1e6
+        self.span.set_attribute("voice.time_to_first_audio_ms", round(ms))
+        _ttfa.record(ms, {"agent": agent, "trigger": self.trigger})
 
   def event(self, name: str, **attrs):
     if self.span is not None:
@@ -129,6 +139,7 @@ class LiveVoiceSession:
     # to Gemini Live by run_live(). A NEW queue per conversation (never reuse).
     self.queue = LiveRequestQueue()
     self.turn = _TurnTracker(session_id)  # OTel: one "model_turn" span per reply
+    self.resumption_updates = 0           # Live API session resumption updates seen
 
   # ===========================================================================
   # Client -> model (called by the server's upstream task)
@@ -148,7 +159,7 @@ class LiveVoiceSession:
     text = (text or "").strip()[:MAX_TEXT_LEN]
     if text:
       self.transcript.add_turn("User", text)  # typed text has no audio transcription, log it here
-      self.turn.start()  # typed turn: the latency clock starts now
+      self.turn.start(trigger="user_text")  # typed turn: the latency clock starts now
       self.queue.send_content(types.Content(role="user", parts=[types.Part(text=text)]))
 
   def close(self):
@@ -217,9 +228,21 @@ class LiveVoiceSession:
           speaker = "User" if role == "user" else "Assistant"
           self.transcript.add_turn(speaker, tr.text, agent=None if role == "user" else author)
           if role == "user":
-            turn.start(current_agent or "")  # user finished speaking: the clock starts
+            turn.start(current_agent or "", trigger="user_speech")  # user finished speaking: the clock starts
 
     turn.usage(event.usage_metadata)
+
+    # --- Live API session resumption. A Live API connection lasts ~10 min; the
+    # server sends these updates so ADK can reconnect without losing context
+    # (ADK handles GoAway + reconnect itself and logs it at INFO). The handle is
+    # a resumption credential, so only the count and `resumable` are recorded.
+    update = event.live_session_resumption_update
+    if update:
+      self.resumption_updates += 1
+      span = trace.get_current_span()  # the call's voice_session span
+      span.set_attribute("live_api.resumption_updates", self.resumption_updates)
+      span.set_attribute("live_api.resumable", bool(update.resumable))
+      logger.debug("Live API session resumption update (resumable=%s)", update.resumable)
 
     # --- Barge-in: the user started talking over the model. The client must
     # immediately drop any audio it has queued but not yet played.

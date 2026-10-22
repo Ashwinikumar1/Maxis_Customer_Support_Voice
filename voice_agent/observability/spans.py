@@ -6,6 +6,7 @@ It reads the existing `voice_session` span, so nothing in server.py changes:
 - voice.sessions.active   (UpDownCounter)  calls in progress on this instance
 - voice.session.duration  (Histogram, s)   call length, by outcome
 - voice.sessions          (Counter)        finished calls, by outcome (ok / error)
+                                           and close_reason (from server.py)
 
 It also copies `session.id` from a parent span to every child span that lacks
 it, and sets the standard `gen_ai.conversation.id`, so ADK's agent and tool
@@ -55,7 +56,8 @@ class SessionSpanProcessor(SpanProcessor):
       outcome = "error" if span.status.status_code == StatusCode.ERROR else "ok"
       if span.start_time and span.end_time:
         _duration.record((span.end_time - span.start_time) / 1e9, {"outcome": outcome})
-      _finished.add(1, {"outcome": outcome})
+      close_reason = (span.attributes or {}).get("voice.close_reason", "unknown")
+      _finished.add(1, {"outcome": outcome, "close_reason": close_reason})
     except Exception:
       pass
 

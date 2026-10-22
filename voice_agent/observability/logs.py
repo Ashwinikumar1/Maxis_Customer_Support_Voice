@@ -15,6 +15,7 @@
 
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -26,6 +27,11 @@ from . import settings
 _ERROR_EVENT_TYPE = "type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent"
 _SEVERITY = {"WARN": "WARNING", "FATAL": "CRITICAL"}
 _NOISY_LOGGERS = ("websockets",)  # logs "connection rejected (200 OK)" for every static file
+# ADK logs every Live API session resumption update at INFO, handle included
+# ("Update session resumption handle: new_handle='...'"). Google's Live API docs
+# describe the handle as a resumption token, so it must not reach Cloud Logging.
+_ADK_LIVE_LOGGER = "google_adk.google.adk.live._live_llm_flow"
+_HANDLE = re.compile(r"""new_handle=('[^']*'|"[^"]*")""")
 
 
 def _span_fields():
@@ -96,6 +102,19 @@ class SpanErrorHandler(logging.Handler):
       pass
 
 
+class RedactResumptionHandle(logging.Filter):
+  """Replaces the Live API session resumption handle in ADK's log line."""
+
+  def filter(self, record: logging.LogRecord) -> bool:
+    try:
+      message = record.getMessage()
+      if "new_handle=" in message:
+        record.msg, record.args = _HANDLE.sub("new_handle='[redacted]'", message), None
+    except Exception:
+      pass
+    return True
+
+
 def configure_logging() -> None:
   """Installs the root handlers. Must run BEFORE streaming_core is imported:
   its logging.basicConfig() is then a no-op because the root logger already
@@ -115,6 +134,10 @@ def configure_logging() -> None:
   # Python warnings (e.g. ADK's "[EXPERIMENTAL] feature ... is enabled") otherwise go to
   # stderr as raw multi-line text; route them through logging so they are JSON too.
   logging.captureWarnings(True)
+
+  adk_live = logging.getLogger(_ADK_LIVE_LOGGER)
+  if not any(isinstance(f, RedactResumptionHandle) for f in adk_live.filters):
+    adk_live.addFilter(RedactResumptionHandle())  # logger-level: applies before any handler
 
   for name in _NOISY_LOGGERS:
     logging.getLogger(name).setLevel(max(logging.WARNING, root.level))

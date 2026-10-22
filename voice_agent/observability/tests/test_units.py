@@ -150,7 +150,7 @@ class FaqTracingTests(unittest.TestCase):
     self.assertEqual(span.attributes["vertex_ai_search.query_length"], 7)
     self.assertNotIn("roaming", json.dumps(dict(span.attributes)))  # query text never recorded
 
-  def test_failure_is_logged_and_marked(self):
+  def test_failure_is_marked_and_raised_without_logging(self):
     EXPORTER.clear()
 
     class FakeHTTPError(Exception):
@@ -160,10 +160,10 @@ class FaqTracingTests(unittest.TestCase):
       raise FakeHTTPError("forbidden")
 
     traced = faq_tracing.wrap(failing, "engine-1")
-    with self.assertLogs("voice_agent.faq_search", level="ERROR") as captured:
+    # The tool's own `except` logs the failure; the wrapper must not log it twice.
+    with self.assertNoLogs("voice_agent.faq_search", level="ERROR"):
       with self.assertRaises(FakeHTTPError):
         traced("q")
-    self.assertIn("HTTP 403", captured.output[0])
     span = EXPORTER.get_finished_spans()[-1]
     self.assertEqual(span.status.status_code, StatusCode.ERROR)
     self.assertEqual(span.attributes["http.response.status_code"], 403)
@@ -178,9 +178,13 @@ class FaqTracingTests(unittest.TestCase):
     original = tool._search
     try:
       tool._search = faq_tracing.wrap(mock.Mock(side_effect=KeyError("GOOGLE_CLOUD_PROJECT")), "e")
-      with self.assertLogs("voice_agent.faq_search", level="ERROR"):
+      with self.assertLogs("voice_agent.faq_search", level="ERROR") as captured:
         result = asyncio.run(tool.search_knowledge_base("plans"))
       self.assertIn("error", result)  # existing behaviour preserved
+      self.assertEqual(len(captured.records), 1, "each failure is logged exactly once")
+      self.assertIn("KeyError", captured.records[0].getMessage())
+      self.assertIsNotNone(captured.records[0].exc_info)
+      self.assertNotIn("plans", captured.output[0])  # the query (PII) is not logged
     finally:
       tool._search = original
 

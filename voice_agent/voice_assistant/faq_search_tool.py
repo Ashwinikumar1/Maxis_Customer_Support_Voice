@@ -1,6 +1,7 @@
 """FAQ search tool: queries the Maxis Vertex AI Search app, returns the top 3 snippets."""
 
 import asyncio
+import logging
 import os
 
 import google.auth
@@ -8,6 +9,7 @@ from google.auth.transport.requests import AuthorizedSession
 
 _ENGINE = os.getenv("FAQ_SEARCH_ENGINE_ID", "maxis-faq-search-app_1792223644923")
 _session = None
+logger = logging.getLogger("voice_agent.faq_search")
 
 
 def _search(query: str) -> list[str]:
@@ -40,5 +42,8 @@ async def search_knowledge_base(query: str) -> dict:
   """
   try:
     return {"results": await asyncio.to_thread(_search, query)}
-  except Exception:
+  except Exception as e:
+    # The caller still gets the friendly fallback; the cause goes to the logs
+    # (with traceback, so Error Reporting groups it). The query is not logged: PII.
+    logger.exception("FAQ search failed (%s)", type(e).__name__)
     return {"error": "The knowledge base is unavailable right now."}

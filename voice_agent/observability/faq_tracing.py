@@ -6,20 +6,19 @@ on every call, so wrapping that attribute gives each search:
 
 - a CLIENT span `vertex_ai_search.search` (ERROR status + exception on failure,
   HTTP status code, result count), nested under ADK's execute_tool span;
-- an ERROR log line with the exception type and traceback;
+- (the ERROR log line itself is written by search_knowledge_base's own
+  `except`, so each failure is logged once);
 - `voice.faq_search.duration` (Histogram, ms) by outcome.
 
 The caller's query is PII, so only its length is recorded.
 """
 
 import functools
-import logging
 import time
 
 from opentelemetry import metrics, trace
 from opentelemetry.trace import SpanKind
 
-logger = logging.getLogger("voice_agent.faq_search")
 _tracer = trace.get_tracer("maxis_voice_agent.observability")
 _meter = metrics.get_meter("maxis_voice_agent.observability")
 _latency = _meter.create_histogram(
@@ -55,8 +54,7 @@ def wrap(search_fn, engine_id: str):
         code = _status_code(exc)
         if code is not None:
           span.set_attribute("http.response.status_code", code)
-        logger.exception("FAQ search failed (%s%s)", outcome, f", HTTP {code}" if code else "")
-        raise
+        raise  # start_as_current_span records the exception and sets ERROR
       finally:
         _latency.record((time.perf_counter() - start) * 1000, {"outcome": outcome})
 

@@ -22,6 +22,8 @@ class _FileExporter(SpanExporter):
     with open(self.path, "a", encoding="utf-8") as fh:
       for s in spans:
         fh.write(json.dumps({"name": s.name, "status": s.status.status_code.name,
+                             "trace_id": f"{s.context.trace_id:032x}",
+                             "links": [f"{l.context.trace_id:032x}" for l in (s.links or ())],
                              "attributes": dict(s.attributes or {})}) + "\n")
     return SpanExportResult.SUCCESS
 

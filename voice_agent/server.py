@@ -20,6 +20,8 @@ import binascii
 import json
 import mimetypes
 import os
+import re
+import time
 import uuid
 from http import HTTPStatus
 from pathlib import Path
@@ -49,6 +51,8 @@ from streaming_core import (  # noqa: E402
     LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
 from voice_assistant.agent import create_root_agent  # noqa: E402
 from opentelemetry import trace  # noqa: E402
+from opentelemetry.trace import Link, SpanContext, TraceFlags  # noqa: E402
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator  # noqa: E402
 
 
 def _setup_otel() -> None:
@@ -156,10 +160,35 @@ def process_request(connection, request):
 # =============================================================================
 # 4. Voice session: one call of handle_client == one conversation
 # =============================================================================
+def _request_trace_links(headers) -> list[Link]:
+  """Span link to the Cloud Run request trace of the WebSocket handshake.
+
+  Cloud Run populates the W3C `traceparent` header; Google recommends it, with
+  the legacy `X-Cloud-Trace-Context` (TRACE_ID/DECIMAL_SPAN_ID;o=1) as fallback.
+  A LINK, not a parent: Cloud Run samples at most ~1 request / 10 s per
+  instance, and a parent's "not sampled" flag would drop most call traces.
+  """
+  traceparent = headers.get("traceparent")
+  if traceparent:
+    ctx = trace.get_current_span(
+        TraceContextTextMapPropagator().extract({"traceparent": traceparent})).get_span_context()
+    if ctx.is_valid:
+      return [Link(ctx, {"link.source": "cloud_run_request"})]
+  match = re.match(r"^([0-9a-fA-F]{32})/(\d+)(?:;o=(\d))?", headers.get("X-Cloud-Trace-Context") or "")
+  if match:
+    ctx = SpanContext(trace_id=int(match[1], 16), span_id=int(match[2]) & 0xFFFFFFFFFFFFFFFF, is_remote=True,
+                      trace_flags=TraceFlags(TraceFlags.SAMPLED if match[3] == "1" else TraceFlags.DEFAULT))
+    if ctx.is_valid:
+      return [Link(ctx, {"link.source": "cloud_run_request"})]
+  return []
+
+
 async def handle_client(websocket):
   # One root span per conversation: every ADK span (agent, model, tool) created
   # inside becomes a child, so Cloud Trace shows the whole call as one trace.
-  with tracer.start_as_current_span("voice_session"):
+  request = getattr(websocket, "request", None)
+  links = _request_trace_links(request.headers) if request is not None else []
+  with tracer.start_as_current_span("voice_session", links=links):
     await _handle_client(websocket)
 
 
@@ -180,7 +209,7 @@ async def _handle_client(websocket):
           timezone = str(msg.get("timezone") or "")[:64] or None
           break
   except TimeoutError:
-    pass
+    logger.info("No init message within %.0f s - using the default timezone", INIT_TIMEOUT_S)
   ctx = get_datetime_info(timezone)  # {"timezone","date","time","greeting"}
 
   # --- 4b. Build the per-conversation ADK objects.
@@ -191,10 +220,14 @@ async def _handle_client(websocket):
   #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
   # TODO(security): no auth yet - derive user_id from a verified identity in prod.
   user_id, session_id = f"user_{client_id}", f"session_{client_id}"
-  trace.get_current_span().set_attribute("session.id", session_id)  # match trace <-> transcript
+  call_span = trace.get_current_span()
+  call_span.set_attribute("session.id", session_id)  # match trace <-> transcript
+  span_ctx = call_span.get_span_context()
   await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
   runner = Runner(app_name=APP_NAME, agent=create_root_agent(ctx), session_service=session_service)
-  transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"])
+  # trace_id in the transcript = jump from a transcript to its trace in Cloud Trace.
+  transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"],
+                                trace_id=f"{span_ctx.trace_id:032x}" if span_ctx.is_valid else None)
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
                              run_config=default_run_config(VOICE_NAME), transcript=transcript)
   logger.info("Session %s started (%s)", session_id, ctx["timezone"])
@@ -203,18 +236,36 @@ async def _handle_client(websocket):
   # Reads WebSocket messages and pushes them into the session's LiveRequestQueue:
   # mic audio chunks (base64 PCM16 16 kHz) and typed text. Returns on "end" or
   # when the browser disconnects (the async-for loop simply finishes).
+  # Client input that is dropped (malformed JSON, oversized / invalid base64
+  # audio) is counted and its first occurrence logged: silently lost audio is
+  # the usual cause of "the bot didn't hear me".
+  dropped = {"invalid_message": 0, "invalid_audio": 0}
+
+  def _drop(kind: str, what: str):
+    dropped[kind] += 1
+    if dropped[kind] == 1:
+      logger.warning("Session %s: dropped %s (further drops are counted)", session_id, what)
+
   async def upstream():
     async for raw in websocket:
       msg = _parse(raw)
+      if not msg:
+        _drop("invalid_message", "a malformed or non-JSON message")
+        continue
       kind = msg.get("type")
       if kind == "audio":
-        session.send_audio(_b64(msg.get("data")))
+        pcm = _b64(msg.get("data"))
+        if pcm:
+          session.send_audio(pcm)
+        else:
+          _drop("invalid_audio", "an oversized or invalid base64 audio frame")
       elif kind == "text":
         session.send_text(str(msg.get("data", "")))
       elif kind == "ping":
         await send({"type": "pong"})
       elif kind == "end":
-        return
+        return "client_end"
+    return "client_disconnect"
 
   # --- 4d. DOWNSTREAM callback: Gemini -> browser.
   # LiveVoiceSession calls emit(type, **data) for everything the model does.
@@ -231,13 +282,27 @@ async def _handle_client(websocket):
   # Both directions must be live at the same time so the user can interrupt
   # (barge in) while the model is speaking. When either side finishes
   # (browser disconnects, "end", or a Live API error) we tear everything down.
+  # Why the call ended: client_end | client_disconnect | live_session_ended |
+  # error | server_shutdown. Recorded on the voice_session span and in the log.
+  close_reason = "unknown"
+  started = time.monotonic()
   tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
   try:
     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in done:
       exc = task.exception()
       if exc and not isinstance(exc, ConnectionClosed):  # a normal disconnect is not an error
+        close_reason = "error"
         raise exc
+      if exc:
+        close_reason = "client_disconnect"
+      elif task is tasks[0]:
+        close_reason = task.result()
+      else:
+        close_reason = "live_session_ended"
+  except asyncio.CancelledError:
+    close_reason = "server_shutdown"  # e.g. SIGTERM on Cloud Run
+    raise
   except Exception:
     # Log full details server-side; send only a generic message to the client.
     logger.exception("Session %s failed", session_id)
@@ -253,7 +318,14 @@ async def _handle_client(websocket):
     session.close()
     await transcript.save()  # dump once per session
     await websocket.close()
-    logger.info("Session %s closed", session_id)
+    duration_s = time.monotonic() - started
+    call_span.set_attributes({
+        "voice.close_reason": close_reason,
+        "voice.dropped.invalid_audio": dropped["invalid_audio"],
+        "voice.dropped.invalid_message": dropped["invalid_message"],
+    })
+    logger.info("Session %s closed (reason=%s, duration=%.1fs, invalid_audio=%d, invalid_messages=%d)",
+                session_id, close_reason, duration_s, dropped["invalid_audio"], dropped["invalid_message"])
 
 
 # =============================================================================
