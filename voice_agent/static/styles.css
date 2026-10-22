@@ -55,4 +55,23 @@ main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; paddin
 .tag.tool { background: #3a2f12; color: #f5c46b; }
 .tag.transfer, .tag.agent { background: #1f2d4d; color: #8fb3ff; }
 .tag.error { background: #4a1d1f; color: #ff9592; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.tag.handover { background: #12362a; color: #7ee2b8; }
+.caller { display: flex; align-items: center; gap: 6px; }
+.caller select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 8px; font-size: 13px; max-width: 320px;
+}
+.hint { margin: 0; padding: 6px 20px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.handover { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
+.handover.escalated { border-color: #f5a524; }
+.handover.contained { border-color: var(--ok); }
+.handover-title { font-weight: 600; margin-bottom: 6px; }
+.handover dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 4px 10px; font-size: 13px; }
+.handover dt { color: var(--muted); }
+.handover dd { margin: 0; word-break: break-word; }
+.demo-controls { margin-top: 10px; display: flex; gap: 8px; }
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  header { flex-wrap: wrap; gap: 8px; }
+  .controls { flex-wrap: wrap; }
+}

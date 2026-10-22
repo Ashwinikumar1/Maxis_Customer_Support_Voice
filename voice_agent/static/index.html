@@ -3,21 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Live Voice Agent</title>
+  <title>Maxis Voice Agent (test client)</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <header>
     <div class="brand">
       <span class="dot" id="statusDot"></span>
-      <h1>Live Voice Agent</h1>
+      <h1>Maxis Voice Agent</h1>
       <span class="pill" id="agentPill">offline</span>
+      <span class="pill" id="modePill" title="Routing mode and gateway"></span>
     </div>
     <div class="controls">
+      <label class="caller">
+        <span>Test caller</span>
+        <select id="callerSelect"></select>
+      </label>
       <span id="statusText">Not connected</span>
       <button id="micBtn" class="primary">Start talking</button>
     </div>
   </header>
+  <p id="callerHint" class="hint"></p>
 
   <main>
     <section class="panel transcript-panel">
@@ -30,9 +36,18 @@
       </form>
     </section>
 
-    <section class="panel">
+    <section class="panel side">
+      <div id="handover" class="handover" hidden>
+        <h2>Call outcome</h2>
+        <div id="handoverTitle" class="handover-title"></div>
+        <dl id="handoverBody"></dl>
+      </div>
       <h2>Activity</h2>
       <ul id="activity" class="activity"></ul>
+      <div class="demo-controls">
+        <button id="failBtn" type="button" disabled
+                title="The next two roaming tool calls fail, to test retry and escalation">Fail next 2 roaming calls</button>
+      </div>
     </section>
   </main>
 
