@@ -49,9 +49,9 @@ from websockets.http11 import Response  # noqa: E402
 
 from streaming_core import (  # noqa: E402
     LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
-from streaming_core.utils import shutdown_requested  # noqa: E402
+from streaming_core.utils import current_session_id, shutdown_requested  # noqa: E402
 from voice_assistant.agent import create_root_agent  # noqa: E402
-from opentelemetry import trace  # noqa: E402
+from opentelemetry import metrics, trace  # noqa: E402
 from opentelemetry.trace import Link, SpanContext, TraceFlags  # noqa: E402
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator  # noqa: E402
 
@@ -86,6 +86,25 @@ def _setup_otel() -> None:
 
 _setup_otel()
 tracer = trace.get_tracer("maxis_voice_agent")
+
+# [Observability #13] Call-level metrics, recorded HERE - not derived from spans.
+# WHY HERE: trace sampling can be switched on with OTEL_TRACES_SAMPLER (see
+# .env.example). The OpenTelemetry SDK runs no span processor at all for a call
+# that is not sampled (verified: Tracer.start_span returns a NonRecordingSpan),
+# so metrics computed from spans would undercount by exactly the sampling rate,
+# e.g. show 10% of real calls at OTEL_TRACES_SAMPLER_ARG=0.1. Metrics recorded
+# directly are always complete, whatever the sampling setting.
+#   voice.sessions.active  calls in progress on this instance (capacity planning:
+#                          today's deploy settings allow 5 instances x 20 calls)
+#   voice.session.duration call length in seconds, by outcome and close_reason
+#   voice.sessions         finished calls, by outcome (ok / error) and close_reason
+_meter = metrics.get_meter("maxis_voice_agent")
+_sessions_active = _meter.create_up_down_counter(
+    "voice.sessions.active", description="Voice calls in progress on this instance")
+_session_duration = _meter.create_histogram(
+    "voice.session.duration", unit="s", description="Voice call duration, by outcome and close_reason")
+_sessions_finished = _meter.create_counter(
+    "voice.sessions", description="Finished voice calls, by outcome and close_reason")
 
 # =============================================================================
 # 2. Configuration (all overridable from .env)
@@ -260,6 +279,9 @@ async def _handle_client(websocket):
   #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
   # TODO(security): no auth yet - derive user_id from a verified identity in prod.
   user_id, session_id = f"user_{client_id}", f"session_{client_id}"
+  # [#13] Every log line from here on - including from tasks this call starts -
+  # carries this session ID, whether or not the call's trace is sampled.
+  current_session_id.set(session_id)
   # `call_span` is this call's `voice_session` span. It is kept in a variable
   # because the cleanup block at the end of this function records why the call
   # ended on it ([Observability #9c]).
@@ -362,6 +384,7 @@ async def _handle_client(websocket):
   # live calls.
   close_reason = "unknown"
   started = time.monotonic()
+  _sessions_active.add(1)  # [#13] matched by add(-1) in the `finally` below
   tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
   try:
     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -401,6 +424,19 @@ async def _handle_client(websocket):
     for task in tasks:
       task.cancel()
     session.close()
+    # [#13] Call metrics FIRST, before anything below that awaits: if the
+    # cleanup were interrupted (e.g. a second cancellation during shutdown),
+    # voice.sessions.active must still go back down, or the dashboard would
+    # show calls that no longer exist. Complete even when this call's trace is
+    # not sampled. outcome: "error" only when the call failed in our code or
+    # the Live API; every other ending (hang-up, network drop, shutdown) is
+    # "ok" - the close_reason attribute tells those apart.
+    duration_s = time.monotonic() - started
+    outcome = "error" if close_reason == "error" else "ok"
+    call_metric_attrs = {"outcome": outcome, "close_reason": close_reason}
+    _sessions_active.add(-1)
+    _session_duration.record(duration_s, call_metric_attrs)
+    _sessions_finished.add(1, call_metric_attrs)
     # [Observability #12] Token usage of this call, taken ONCE here and used
     # everywhere: the transcript (saved next, so it must be set first), the
     # call's span and the closing log line below, and the voice.call.tokens
@@ -419,7 +455,6 @@ async def _handle_client(websocket):
     # line it is readable at a glance. Example:
     #   Session session_ab12 closed (reason=client_end, duration=184.2s,
     #   invalid_audio=0, invalid_messages=0)
-    duration_s = time.monotonic() - started
     call_span.set_attributes({
         "voice.close_reason": close_reason,
         "voice.dropped.invalid_audio": dropped["invalid_audio"],

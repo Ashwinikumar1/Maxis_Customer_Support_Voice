@@ -67,8 +67,14 @@ ENV_VARS=(
   "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=$ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
+  # [Observability #13] Trace sampling - every call by default; see .env.example for why.
+  "OTEL_TRACES_SAMPLER=${OTEL_TRACES_SAMPLER:-parentbased_always_on}"
   "ALLOWED_ORIGINS=$SERVICE_URL"
 )
+# The sampling rate only applies to ratio samplers; pass it only when it is set.
+if [[ -n "${OTEL_TRACES_SAMPLER_ARG:-}" ]]; then
+  ENV_VARS+=("OTEL_TRACES_SAMPLER_ARG=$OTEL_TRACES_SAMPLER_ARG")
+fi
 ENV_ARG="^@^$(IFS=@; echo "${ENV_VARS[*]}")"   # '@' delimiter: values may contain commas
 
 echo "== Deploy $SERVICE -> $SERVICE_URL"

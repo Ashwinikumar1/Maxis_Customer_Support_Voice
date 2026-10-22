@@ -35,7 +35,8 @@ ENV HOST=0.0.0.0 \
     ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false \
     OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=NO_CONTENT \
     LOG_FORMAT=json \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    OTEL_TRACES_SAMPLER=parentbased_always_on
 EXPOSE 8080
 
 # Exec form: Python is PID 1 and receives Cloud Run's SIGTERM directly.

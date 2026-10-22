@@ -37,7 +37,12 @@ OBS_ENV=(
   "LOG_LEVEL=${LOG_LEVEL:-INFO}"
   "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=${ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS:-false}"
   "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-NO_CONTENT}"
+  # [#13] Trace sampling - every call by default; see .env.example for the cost estimate.
+  "OTEL_TRACES_SAMPLER=${OTEL_TRACES_SAMPLER:-parentbased_always_on}"
 )
+if [[ -n "${OTEL_TRACES_SAMPLER_ARG:-}" ]]; then
+  OBS_ENV+=("OTEL_TRACES_SAMPLER_ARG=$OTEL_TRACES_SAMPLER_ARG")
+fi
 # Google's recommended GenAI semantic conventions: opt in from .env after a staging check.
 if [[ -n "${OTEL_SEMCONV_STABILITY_OPT_IN:-}" ]]; then
   OBS_ENV+=("OTEL_SEMCONV_STABILITY_OPT_IN=$OTEL_SEMCONV_STABILITY_OPT_IN")

@@ -72,6 +72,26 @@ class LoggingTests(unittest.TestCase):
     self.assertEqual(entry["session_id"], "session_abc")
     self.assertIn("line", entry["logging.googleapis.com/sourceLocation"])
 
+  def test_unsampled_call_keeps_session_id_in_logs(self):
+    """[#13] An unsampled call's span has no attributes; the session ID must come
+    from streaming_core.utils.current_session_id instead."""
+    from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, use_span
+
+    from streaming_core.utils import current_session_id
+
+    log, stream = self._logger(logs.CloudJsonFormatter())
+    unsampled = NonRecordingSpan(SpanContext(trace_id=0xABC, span_id=0x123, is_remote=False,
+                                             trace_flags=TraceFlags(TraceFlags.DEFAULT)))
+    token = current_session_id.set("session_unsampled")
+    try:
+      with use_span(unsampled):
+        log.info("inside an unsampled call")
+    finally:
+      current_session_id.reset(token)
+    entry = json.loads(stream.getvalue())
+    self.assertEqual(entry["session_id"], "session_unsampled")
+    self.assertIs(entry["logging.googleapis.com/trace_sampled"], False)
+
   def test_json_without_span_has_no_trace(self):
     log, stream = self._logger(logs.CloudJsonFormatter())
     log.info("plain")
@@ -114,7 +134,7 @@ class LoggingTests(unittest.TestCase):
 
 class SessionSpanTests(unittest.TestCase):
 
-  def test_children_inherit_session_id_and_session_metrics_recorded(self):
+  def test_children_inherit_session_id(self):
     EXPORTER.clear()
     with TRACER.start_as_current_span("voice_session") as root:
       root.set_attribute("session.id", "session_42")
@@ -125,17 +145,8 @@ class SessionSpanTests(unittest.TestCase):
     for name in ("invoke_agent", "execute_tool search_knowledge_base"):
       self.assertEqual(by_name[name].attributes["session.id"], "session_42")
       self.assertEqual(by_name[name].attributes["gen_ai.conversation.id"], "session_42")
-    self.assertTrue(_metric_points("voice.session.duration"))
-    finished = _metric_points("voice.sessions")
-    self.assertTrue(any(p.attributes.get("outcome") == "ok" for p in finished))
-    active = _metric_points("voice.sessions.active")
-    self.assertEqual(sum(p.value for p in active), 0)  # started and ended
-
-  def test_failed_session_counted_as_error(self):
-    with TRACER.start_as_current_span("voice_session") as root:
-      root.set_status(trace.Status(StatusCode.ERROR))
-    finished = _metric_points("voice.sessions")
-    self.assertTrue(any(p.attributes.get("outcome") == "error" for p in finished))
+    # [#13] The call metrics moved to server.py (sampling-proof); see
+    # test_launcher.test_sampling_off_keeps_metrics_and_log_session_ids.
 
 
 class FaqTracingTests(unittest.TestCase):

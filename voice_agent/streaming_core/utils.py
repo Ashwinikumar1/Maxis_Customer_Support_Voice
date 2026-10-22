@@ -1,5 +1,6 @@
 """Small helpers: audio sample rates, logger, timezone-aware date info."""
 
+import contextvars
 import logging
 import os
 import re
@@ -64,6 +65,18 @@ RECEIVE_SAMPLE_RATE = 24000  # Gemini -> client (PCM16 mono)
 # close_reason="server_shutdown", not "client_disconnect" - otherwise deploys
 # that cut live calls would be misread as caller or network problems.
 shutdown_requested = threading.Event()
+
+# [Observability #13] The session ID of the call the current code is running for.
+# WHY IT EXISTS: log lines carry a `session_id` so every line of one call can be
+# found together. That ID used to be read from the call's trace span. With
+# trace sampling switched on (OTEL_TRACES_SAMPLER, see .env.example), calls
+# that are not sampled get a NON-recording span that holds no attributes
+# (verified in the OpenTelemetry SDK: Tracer.start_span returns NonRecordingSpan),
+# so their log lines would silently lose the session ID. A context variable
+# does not depend on sampling: server.py sets it once per call, and asyncio
+# copies it into every task the call starts (upstream, model loop, ADK tasks).
+current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_session_id", default=None)
 
 
 def get_datetime_info(timezone_str: str | None = None) -> dict:

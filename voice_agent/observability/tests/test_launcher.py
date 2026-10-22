@@ -45,6 +45,43 @@ class LauncherEndToEnd(unittest.TestCase):
     return subprocess.Popen([sys.executable, "-m", "observability.tests._harness"], cwd=APP_DIR, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+  def test_sampling_off_keeps_metrics_and_log_session_ids(self):
+    """[#13] With trace sampling fully off, nothing about a call may go missing
+    except its trace: call metrics stay complete and every log line of a call
+    still carries its session_id (the span holds no attributes when unsampled)."""
+    port = _free_port()
+    tmp = Path(tempfile.mkdtemp())
+    spans_file, metrics_file = tmp / "spans.jsonl", tmp / "metrics.json"
+    proc = self._start(port, spans_file, OTEL_TRACES_SAMPLER="always_off", OBS_TEST_METRICS_FILE=str(metrics_file))
+    try:
+      self._wait_up(port)
+      for _ in range(2):  # two calls; both fail fast without Google credentials
+        asyncio.run(self._session(port))
+      proc.send_signal(signal.SIGTERM)
+      out, _ = proc.communicate(timeout=15)
+    finally:
+      if proc.poll() is None:
+        proc.kill()
+
+    entries = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+    self.assertTrue(any("trace_sampler=always_off" in e["message"] for e in entries), "sampler logged at start-up")
+    # No trace was stored for either call ...
+    spans = [json.loads(l) for l in spans_file.read_text().splitlines()] if spans_file.exists() else []
+    self.assertFalse([s for s in spans if s["name"] == "voice_session"])
+    # ... but every line of each call still names its session, marked as not sampled.
+    started = [e for e in entries if e["message"].startswith("Session ") and " started " in e["message"]]
+    self.assertEqual(len(started), 2)
+    for e in started:
+      self.assertEqual(e["session_id"], e["message"].split()[1])
+      self.assertIs(e["logging.googleapis.com/trace_sampled"], False)
+    # ... and the call metrics count both calls.
+    metrics = json.loads(metrics_file.read_text())
+    finished = metrics["voice.sessions"]
+    self.assertEqual(sum(p["value"] for p in finished), 2)
+    self.assertEqual({p["attributes"]["close_reason"] for p in finished}, {"error"})
+    self.assertEqual(sum(p["value"] for p in metrics["voice.sessions.active"]), 0)
+    self.assertEqual(sum(p["count"] for p in metrics["voice.session.duration"]), 2)
+
   def test_sigterm_during_live_call_saves_transcript_and_span(self):
     port = _free_port()
     spans_file = Path(tempfile.mkdtemp()) / "spans.jsonl"

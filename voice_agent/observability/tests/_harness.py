@@ -1,9 +1,11 @@
 """Test harness: the real launcher, with spans written to a local JSONL file.
 
 Simulates what ADK does on Cloud Run (maybe_set_otel_providers with an
-exporter) but exports to OBS_TEST_SPANS_FILE instead of Cloud Trace.
+exporter) but exports to OBS_TEST_SPANS_FILE instead of Cloud Trace, and -
+when OBS_TEST_METRICS_FILE is set - writes the final metric values there on exit.
 """
 
+import atexit
 import json
 import os
 
@@ -28,12 +30,35 @@ class _FileExporter(SpanExporter):
     return SpanExportResult.SUCCESS
 
 
+def _dump_metrics(reader, path):
+  """Writes {metric name: [{attributes, value or count}]} for the voice.* metrics."""
+  out = {}
+  data = reader.get_metrics_data()
+  for rm in (data.resource_metrics if data else []):
+    for sm in rm.scope_metrics:
+      for m in sm.metrics:
+        if m.name.startswith("voice."):
+          out[m.name] = [{"attributes": dict(p.attributes),
+                          "value": getattr(p, "value", None), "count": getattr(p, "count", None)}
+                         for p in m.data.data_points]
+  with open(path, "w", encoding="utf-8") as fh:
+    json.dump(out, fh)
+
+
 def _install_with_file_exporter():
   real_install()
   from google.adk.telemetry import setup as adk_setup
 
+  readers = []
+  if os.getenv("OBS_TEST_METRICS_FILE"):
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    reader = InMemoryMetricReader()
+    readers.append(reader)
+    atexit.register(_dump_metrics, reader, os.environ["OBS_TEST_METRICS_FILE"])
   adk_setup.maybe_set_otel_providers(
-      [adk_setup.OTelHooks(span_processors=[SimpleSpanProcessor(_FileExporter(os.environ["OBS_TEST_SPANS_FILE"]))])])
+      [adk_setup.OTelHooks(span_processors=[SimpleSpanProcessor(_FileExporter(os.environ["OBS_TEST_SPANS_FILE"]))],
+                           metric_readers=readers)])
 
 
 def _hang_live_sessions():

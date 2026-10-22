@@ -60,5 +60,9 @@ def install() -> None:
     except Exception:
       # A hook that cannot attach (e.g. an ADK upgrade renamed something) must not stop the server.
       logger.exception("Observability hook %s could not be installed; continuing without it", module_name)
-  logger.info("Observability add-on installed (log_format=%s, level=%s, hooks=%s)",
-              settings.log_format(), settings.log_level(), ",".join(enabled) or "none")
+  # [#13] The active trace sampler is logged at start-up, so anyone looking at
+  # a gap in Cloud Trace can confirm from the logs whether sampling was on.
+  logger.info("Observability add-on installed (log_format=%s, level=%s, hooks=%s, trace_sampler=%s%s)",
+              settings.log_format(), settings.log_level(), ",".join(enabled) or "none",
+              os.getenv("OTEL_TRACES_SAMPLER", "parentbased_always_on (SDK default)"),
+              f" {os.getenv('OTEL_TRACES_SAMPLER_ARG')}" if os.getenv("OTEL_TRACES_SAMPLER_ARG") else "")

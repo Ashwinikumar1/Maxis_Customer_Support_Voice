@@ -1,32 +1,24 @@
-"""Session-level telemetry from the spans the app already creates (gaps #7 and #9).
+"""Session ID on every span of a call (gap #7).
 
 SessionSpanProcessor is registered on ADK's TracerProvider (see adk_hook.py).
-It reads the existing `voice_session` span, so nothing in server.py changes:
+It copies `session.id` from a parent span to every child span that lacks it,
+and sets the standard `gen_ai.conversation.id`, so ADK's agent and tool spans
+can be filtered by call in Trace Explorer.
 
-- voice.sessions.active   (UpDownCounter)  calls in progress on this instance
-- voice.session.duration  (Histogram, s)   call length, by outcome
-- voice.sessions          (Counter)        finished calls, by outcome (ok / error)
-                                           and close_reason (from server.py)
-
-It also copies `session.id` from a parent span to every child span that lacks
-it, and sets the standard `gen_ai.conversation.id`, so ADK's agent and tool
-spans can be filtered by call in Trace Explorer.
+[Observability #13] The call metrics (voice.sessions.active,
+voice.session.duration, voice.sessions) used to be computed here from the
+`voice_session` span. They moved to server.py: with trace sampling on, the
+OpenTelemetry SDK runs no span processor for unsampled calls, so metrics built
+here would have undercounted by the sampling rate. Copying attributes onto
+spans is still right here - unsampled spans are never exported anyway.
 """
 
-from opentelemetry import metrics, trace
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
-from opentelemetry.trace import StatusCode
 
 SESSION_SPAN = "voice_session"
 _SESSION_ID = "session.id"
 _CONVERSATION_ID = "gen_ai.conversation.id"
-
-_meter = metrics.get_meter("maxis_voice_agent.observability")
-_active = _meter.create_up_down_counter(
-    "voice.sessions.active", description="Voice calls in progress on this instance")
-_duration = _meter.create_histogram(
-    "voice.session.duration", unit="s", description="Voice call duration, by outcome")
-_finished = _meter.create_counter("voice.sessions", description="Finished voice calls, by outcome")
 
 
 class SessionSpanProcessor(SpanProcessor):
@@ -34,7 +26,6 @@ class SessionSpanProcessor(SpanProcessor):
   def on_start(self, span: Span, parent_context=None) -> None:
     try:
       if span.name == SESSION_SPAN:
-        _active.add(1)
         return
       parent = trace.get_current_span(parent_context)
       parent_attrs = getattr(parent, "attributes", None) or {}
@@ -49,17 +40,7 @@ class SessionSpanProcessor(SpanProcessor):
       pass
 
   def on_end(self, span: ReadableSpan) -> None:
-    try:
-      if span.name != SESSION_SPAN:
-        return
-      _active.add(-1)
-      outcome = "error" if span.status.status_code == StatusCode.ERROR else "ok"
-      if span.start_time and span.end_time:
-        _duration.record((span.end_time - span.start_time) / 1e9, {"outcome": outcome})
-      close_reason = (span.attributes or {}).get("voice.close_reason", "unknown")
-      _finished.add(1, {"outcome": outcome, "close_reason": close_reason})
-    except Exception:
-      pass
+    pass
 
   def shutdown(self) -> None:
     pass

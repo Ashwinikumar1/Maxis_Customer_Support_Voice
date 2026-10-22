@@ -34,15 +34,32 @@ _ADK_LIVE_LOGGER = "google_adk.google.adk.live._live_llm_flow"
 _HANDLE = re.compile(r"""new_handle=('[^']*'|"[^"]*")""")
 
 
+def _session_id(span) -> str | None:
+  """The current call's session ID, independent of trace sampling.
+
+  [Observability #13] First choice is streaming_core.utils.current_session_id,
+  set by server.py for each call: an unsampled call's span is non-recording and
+  has NO attributes, so reading the span alone would drop the session ID from
+  every log line of unsampled calls. The span attribute remains the fallback
+  for code paths that run outside a call's context.
+  """
+  try:
+    from streaming_core.utils import current_session_id
+    if (value := current_session_id.get()):
+      return value
+  except ImportError:  # the add-on used without this app
+    pass
+  attrs = getattr(span, "attributes", None) or {}
+  return attrs.get("session.id") or attrs.get("gen_ai.conversation.id")
+
+
 def _span_fields():
   """(trace_id_hex, span_id_hex, sampled, session_id) for the current span, or None."""
   span = trace.get_current_span()
   ctx = span.get_span_context()
   if not ctx.is_valid:
     return None
-  attrs = getattr(span, "attributes", None) or {}
-  session_id = attrs.get("session.id") or attrs.get("gen_ai.conversation.id")
-  return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}", ctx.trace_flags.sampled, session_id
+  return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}", ctx.trace_flags.sampled, _session_id(span)
 
 
 class CloudJsonFormatter(logging.Formatter):
@@ -62,9 +79,13 @@ class CloudJsonFormatter(logging.Formatter):
       project = settings.project_id()
       entry["logging.googleapis.com/trace"] = f"projects/{project}/traces/{trace_id}" if project else trace_id
       entry["logging.googleapis.com/spanId"] = span_id
+      # [#13] false for calls the sampler did not keep: the line is still
+      # logged, but its trace was not stored in Cloud Trace.
       entry["logging.googleapis.com/trace_sampled"] = sampled
-      if session_id:
-        entry["session_id"] = session_id
+    else:
+      session_id = _session_id(None)  # no tracing at all (e.g. local run): still tag the call
+    if session_id:
+      entry["session_id"] = session_id
     if record.exc_info:
       # Traceback inside `message` keeps it ONE entry and lets Error Reporting group it.
       message = f"{message}\n{self.formatException(record.exc_info)}"

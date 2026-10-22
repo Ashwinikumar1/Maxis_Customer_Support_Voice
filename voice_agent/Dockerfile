@@ -26,10 +26,12 @@ USER app
 
 # Config comes from Cloud Run env vars; Vertex AI, Vertex AI Search, GCS and
 # Cloud Telemetry (OTel) auth via the service account (ADC). Never bake .env into the image.
+# OTEL_TRACES_SAMPLER: trace every call by default ([Observability #13], see .env.example).
 ENV HOST=0.0.0.0 \
     PORT=8080 \
     OTEL_TO_CLOUD=true \
-    OTEL_SERVICE_NAME=maxis-voice-agent
+    OTEL_SERVICE_NAME=maxis-voice-agent \
+    OTEL_TRACES_SAMPLER=parentbased_always_on
 EXPOSE 8080
 
 # Run the venv's python directly (faster cold start than `uv run`).
