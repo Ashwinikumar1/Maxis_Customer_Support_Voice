@@ -220,6 +220,7 @@ class _TurnTracker:
     # the difference is what this turn used (see usage()).
     self.tokens = tokens
     self.tokens_at_start = {}
+    self.agent = ""  # gen_ai.agent.name of the open turn, once known
 
   def start(self, agent: str = "", trigger: str = "model"):
     # [#5] `trigger` is fixed by whoever opens the turn FIRST. If the agent has
@@ -232,7 +233,23 @@ class _TurnTracker:
       self.trigger = trigger
       self.tokens_at_start = self.tokens.totals() if self.tokens else {}  # [#12] baseline for this turn
       self.span = _tracer.start_span("model_turn", start_time=self.start_ns, attributes={
-          "session.id": self.session_id, "gen_ai.agent.name": agent, "voice.turn_trigger": trigger})
+          "session.id": self.session_id, "voice.turn_trigger": trigger})
+      self.agent = ""
+    self.set_agent(agent)
+
+  def set_agent(self, agent: str):
+    """Names the agent answering this turn (gen_ai.agent.name), once it is known.
+
+    WHY: a typed question opens its turn in send_text(), before the model has
+    replied, so the agent's name is not known yet. Found in Cloud Trace on
+    22 Oct 2026: such turns showed an EMPTY gen_ai.agent.name. The name is now
+    set by the first agent event of the turn (speech, tool call, ...) instead,
+    and an empty value is never written. Once transfers to other agents exist,
+    this shows which agent handled each turn.
+    """
+    if self.span is not None and agent and agent != "user" and not self.agent:
+      self.agent = agent
+      self.span.set_attribute("gen_ai.agent.name", agent)
 
   def first_audio(self, agent: str):
     self.start(agent)
@@ -373,6 +390,7 @@ class LiveVoiceSession:
     author = event.author or ""
     if author and author != "user" and author != current_agent:
       await emit("active_agent", name=author)
+    turn.set_agent(author)  # names a turn opened before the agent was known (e.g. typed text)
 
     # --- Tool calls the model decided to make (e.g. search_knowledge_base).
     # ADK executes the tool itself; we only report it to the UI and the log.

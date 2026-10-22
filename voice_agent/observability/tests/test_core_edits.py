@@ -71,6 +71,24 @@ class TimeToFirstAudioTests(unittest.TestCase):  # 5
     self.assertEqual(session.turn.trigger, "user_text")
     session.turn.end("idle")
 
+  def test_typed_turn_gets_the_agent_name_from_its_first_event(self):
+    # Found in Cloud Trace: typed turns had an empty gen_ai.agent.name.
+    turn = _TurnTracker("s1")
+    turn.start(trigger="user_text")     # opened by send_text: agent not known yet
+    turn.set_agent("")                  # events without an author change nothing
+    turn.set_agent("user")
+    turn.set_agent("maxis_agent")       # first agent event (e.g. a tool call)
+    turn.set_agent("roaming_agent")     # the first name sticks for the turn
+    turn.end("idle")
+    span = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(span.attributes["gen_ai.agent.name"], "maxis_agent")
+
+  def test_turn_without_an_agent_event_has_no_empty_name(self):
+    turn = _TurnTracker("s1")
+    turn.start(trigger="user_text")
+    turn.end("interrupted")
+    self.assertNotIn("gen_ai.agent.name", EXPORTER.get_finished_spans()[-1].attributes)
+
 
 class RequestTraceLinkTests(unittest.TestCase):  # 6
 
