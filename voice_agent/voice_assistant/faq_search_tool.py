@@ -9,6 +9,7 @@ from google.auth.transport.requests import AuthorizedSession
 
 _ENGINE = os.getenv("FAQ_SEARCH_ENGINE_ID", "maxis-faq-search-app_1792223644923")
 _session = None
+# [Observability #3b] Logger for FAQ search failures (see search_knowledge_base).
 logger = logging.getLogger("voice_agent.faq_search")
 
 
@@ -43,7 +44,22 @@ async def search_knowledge_base(query: str) -> dict:
   try:
     return {"results": await asyncio.to_thread(_search, query)}
   except Exception as e:
-    # The caller still gets the friendly fallback; the cause goes to the logs
-    # (with traceback, so Error Reporting groups it). The query is not logged: PII.
+    # [Observability #3b] Record every FAQ search failure, once.
+    # THE DESIGN: on failure the tool does NOT raise - it returns a friendly
+    # message, so the agent can tell the caller "the knowledge base is
+    # unavailable" and the conversation continues. That part is unchanged.
+    # WHY THE LOG LINE MATTERS: before, this `except` swallowed the error
+    # completely. From the outside a broken FAQ (wrong engine ID, missing
+    # permission, Vertex AI Search outage, timeout) looked exactly like an
+    # agent that simply did not know the answer, and ADK even recorded the tool
+    # call as successful. Now each failure is written to the logs.
+    # WHAT IS LOGGED: the error type in the message, plus the full traceback
+    # (logger.exception), so Error Reporting can group repeated failures.
+    # Source: https://docs.cloud.google.com/error-reporting/docs/formatting-error-messages
+    # WHAT IS NOT LOGGED: the caller's question (`query`) - it can contain
+    # personal information, so it stays out of the logs.
+    # WHY "ONCE": the observability add-on's span around _search records the
+    # failure on the trace but deliberately does not log it, so each failure
+    # appears exactly one time in the logs and error counts stay accurate.
     logger.exception("FAQ search failed (%s)", type(e).__name__)
     return {"error": "The knowledge base is unavailable right now."}

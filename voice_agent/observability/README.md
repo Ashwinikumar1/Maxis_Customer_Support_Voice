@@ -25,8 +25,8 @@ Running `./deploy.sh` again puts the plain image back; run `./observability/depl
 |---|---|---|
 | #1 logs not linked to traces | One JSON line per log on stdout with `severity`, `message`, `time`, `logging.googleapis.com/trace`, `/spanId`, `/trace_sampled`, `/sourceLocation`, plus `session_id`. Tracebacks stay one entry and reach Error Reporting. Python warnings are JSON too. `LOG_LEVEL` works. `websockets` INFO noise is muted. | `logs.py` |
 | #2 failed calls look OK in Cloud Trace | Any ERROR log inside a span marks that span ERROR and records the exception. The server's existing `logger.exception("Session ... failed")` therefore fails the `voice_session` span. | `logs.py` |
-| #3 FAQ tool failures invisible | `vertex_ai_search.search` CLIENT span (status, HTTP code, result count), ERROR log, `voice.faq_search.duration` metric. Query text is never recorded. The caller still hears the same fallback message. | `faq_tracing.py` |
-| #4 SIGTERM loses data | SIGTERM logs the shutdown and takes the server's existing Ctrl-C exit path: open calls are cancelled, their spans end, transcripts upload. Telemetry is force-flushed at 7 s (watchdog) and again on exit. | `shutdown.py` |
+| #3 FAQ tool failures invisible | `vertex_ai_search.search` CLIENT span (status, HTTP code, result count) and `voice.faq_search.duration` metric. The failure is logged once, by the tool's own `except`. Query text is never recorded. The caller still hears the same fallback message. | `faq_tracing.py` |
+| #4 SIGTERM loses data | SIGTERM logs the shutdown, closes open calls with WebSocket code 1001 ("going away"), and stops the server through asyncio's own Ctrl-C handler (never by raising into running code, which hung ~1 shutdown in 20). Each call's spans end, its transcript uploads, and it is recorded as `close_reason=server_shutdown`. Telemetry is force-flushed at 7 s (watchdog) and again on exit. Measured on Python 3.12: 40/40 clean exits, slowest 0.51 s. | `shutdown.py`, `ws_hooks.py` |
 | #7 PII default, standard ids | `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false` and `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=NO_CONTENT` by default, baked into the image too. Child spans get `session.id` and `gen_ai.conversation.id`. | `settings.py`, `spans.py` |
 | #9 session metrics, security logs | `voice.sessions.active`, `voice.session.duration`, `voice.sessions` (by outcome). WARNING log + `voice.ws.rejected` counter for every cross-site WebSocket 403. | `spans.py`, `ws_hooks.py` |
 | P2 version | `service.version=<git sha>` on every span, metric and log resource. | `deploy.sh` |
@@ -58,6 +58,6 @@ error and the server starts without it.
 cd voice_agent && uv run python -m unittest discover -s observability/tests -t .
 ```
 
-13 tests, including two end-to-end runs of the real `server.py`: a failing call (span marked
+23 tests, including two end-to-end runs of the real `server.py`: a failing call (span marked
 ERROR, logs carry `session_id` and trace), a cross-site 403, and SIGTERM during an in-progress
 call (transcript saved, root span exported, exit in under 10 s).

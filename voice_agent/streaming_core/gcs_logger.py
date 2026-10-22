@@ -58,7 +58,17 @@ class TranscriptLogger:
         logger.info("Transcript saved to gs://%s/%s", self.bucket, self.object_name)
         return
       except Exception as e:
-        # exc_info: full cause + traceback in the log (not just the exception type).
+        # [Observability #8a] Log the FULL error, not just its type.
+        # WHY: the old line said only e.g. "GCS upload failed (Forbidden)". The
+        # type alone does not say WHICH bucket, WHICH permission is missing, or
+        # whether credentials expired - the message and traceback do, so the
+        # cause can be fixed without reproducing the failure.
+        # WHY IT MATTERS ON CLOUD RUN: when the upload fails, the fallback below
+        # writes the transcript to the container's local disk, which is
+        # in-memory and lost when the instance stops. So this log line is often
+        # the only trace that a transcript was lost and why.
+        # exc_info=True puts the traceback into the same log entry, where Error
+        # Reporting can pick it up and group repeated failures.
         logger.error("GCS upload failed (%s) - saving transcript locally instead",
                      type(e).__name__, exc_info=True)
     try:

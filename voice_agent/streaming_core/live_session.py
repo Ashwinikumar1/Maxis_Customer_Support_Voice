@@ -32,6 +32,15 @@ MAX_TEXT_LEN = 2000  # cap typed messages so a client can't flood the model
 # reply, so we add a "model_turn" span and a time-to-first-audio metric here.
 _tracer = trace.get_tracer("maxis_voice_agent.live")
 _meter = metrics.get_meter("maxis_voice_agent.live")
+# [Observability #5] voice.time_to_first_audio = how long a caller waits, after
+# they finish speaking (or send typed text), before the agent starts talking.
+# It is the delay the caller actually hears, so it is THE speed metric for a
+# voice agent: service-level targets and alerts (e.g. "95% of answers start
+# within 1.5 s") are built on it. It must therefore contain only REAL waits -
+# see _TurnTracker.first_audio() for the rule that guarantees that.
+# Honest limitation: the clock starts when the FINAL transcript of the caller's
+# speech arrives from Gemini, which is slightly after they actually stopped
+# talking, so real waits are a little longer than this metric shows.
 _ttfa = _meter.create_histogram(
     "voice.time_to_first_audio", unit="ms",
     description="Final user transcript (or typed text) received -> first model audio chunk. "
@@ -75,8 +84,27 @@ class _TurnTracker:
   (greeting, continuation after a tool) at the first model output, and ends on
   turn_complete or barge-in. `trigger` records which: only user-triggered
   turns have a real start time, so only they feed voice.time_to_first_audio.
+
+  [Observability #5] WHY `trigger` EXISTS
+    A turn can be started in three ways, and they are NOT equal:
+      user_speech - the caller finished speaking  -> a person IS waiting
+      user_text   - the caller sent typed text    -> a person IS waiting
+      model       - the agent speaks on its own: the greeting at the start of
+                    the call, or carrying on after "let me check that" and an
+                    FAQ search                    -> NOBODY is waiting
+    For a `model` turn the stopwatch is started by the agent's first audio
+    itself, so start and stop happen at the same instant and the "wait" reads
+    ~0 ms. The old code recorded those 0 ms values too. Mixed into the
+    histogram they made p50 / p95 look better than calls really are (example:
+    three real waits of 2 s plus two fake 0 s waits averaged 1.2 s instead of
+    2 s), which could hide a real slowdown. Now only user-triggered turns are
+    recorded. `model` turns are still traced (their model_turn span exists,
+    labelled voice.turn_trigger="model"); they just stay out of the metric.
+    The time spent inside an FAQ search is measured separately
+    (voice.faq_search.duration, from the observability add-on).
   """
 
+  # Turns where a real person is waiting - the only ones whose wait is measured.
   _USER_TRIGGERS = ("user_speech", "user_text")
 
   def __init__(self, session_id: str):
@@ -87,6 +115,10 @@ class _TurnTracker:
     self.trigger = "model"
 
   def start(self, agent: str = "", trigger: str = "model"):
+    # [#5] `trigger` is fixed by whoever opens the turn FIRST. If the agent has
+    # already started speaking (a `model` turn is open) when the caller's final
+    # transcript arrives, the turn stays `model` - its true start time is
+    # unknown, so it is left out of the metric rather than recorded wrongly.
     if self.span is None:
       self.start_ns = time.time_ns()
       self.got_audio = False
@@ -99,8 +131,12 @@ class _TurnTracker:
     if not self.got_audio:
       self.got_audio = True
       self.span.add_event("first_audio")
+      # [#5] THE RULE: record the wait only when a person was actually waiting.
       # A model-initiated turn starts AT its first output, so its latency would
       # read ~0 ms and drag the histogram down: record user-triggered turns only.
+      # The `trigger` label on each sample lets dashboards show spoken and typed
+      # turns separately, since they reach the model by different paths
+      # (streamed audio vs. a complete text message).
       if self.trigger in self._USER_TRIGGERS:
         ms = (time.time_ns() - self.start_ns) / 1e6
         self.span.set_attribute("voice.time_to_first_audio_ms", round(ms))
@@ -232,16 +268,36 @@ class LiveVoiceSession:
 
     turn.usage(event.usage_metadata)
 
-    # --- Live API session resumption. A Live API connection lasts ~10 min; the
-    # server sends these updates so ADK can reconnect without losing context
-    # (ADK handles GoAway + reconnect itself and logs it at INFO). The handle is
-    # a resumption credential, so only the count and `resumable` are recorded.
+    # --- [Observability #10] Live API session resumption.
+    # BACKGROUND: one connection to the Gemini Live API lasts only about 10
+    # minutes. To keep longer calls going, Gemini periodically sends a
+    # "session resumption update" carrying a handle; when the connection is
+    # about to close, it sends a GoAway message and ADK reconnects using the
+    # latest handle, so the conversation continues with its context.
+    # Source: https://docs.cloud.google.com/gemini-enterprise-agent-platform/
+    #         models/live-api/start-manage-session ("Session lifetime")
+    # WHY WE RECORD IT: if a caller reports a pause mid-call, or the agent
+    # "forgetting" what was said, the call's trace now shows how many resumption
+    # updates the call had (live_api.resumption_updates) and whether the session
+    # was still resumable (live_api.resumable) - pointing at a reconnect.
+    # WHY THE HANDLE ITSELF IS NEVER RECORDED: the handle lets a new connection
+    # take over this conversation - it behaves like a temporary credential.
+    # It must not end up in traces or logs. (ADK itself logs it at INFO; the
+    # observability add-on redacts it from that log line.)
+    # WHY THERE IS NO GoAway CHECK HERE: verified in ADK 2.12's source
+    # (google/adk/live/_live_llm_flow.py) - ADK consumes GoAway internally,
+    # logs "Received go away signal" at INFO and reconnects; the GoAway event
+    # never reaches this loop, so a check here would never run.
+    # WHY ON THE CALL SPAN, AS A COUNT: these updates can arrive many times in a
+    # long call. One counter attribute on voice_session stays small, whereas an
+    # event per update could exceed Cloud Trace's limit of 256 events per span.
     update = event.live_session_resumption_update
     if update:
       self.resumption_updates += 1
       span = trace.get_current_span()  # the call's voice_session span
       span.set_attribute("live_api.resumption_updates", self.resumption_updates)
       span.set_attribute("live_api.resumable", bool(update.resumable))
+      # DEBUG, not INFO: it can repeat often, and ADK already logs it at INFO.
       logger.debug("Live API session resumption update (resumable=%s)", update.resumable)
 
     # --- Barge-in: the user started talking over the model. The client must

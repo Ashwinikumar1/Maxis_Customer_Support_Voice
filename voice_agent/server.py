@@ -49,6 +49,7 @@ from websockets.http11 import Response  # noqa: E402
 
 from streaming_core import (  # noqa: E402
     LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
+from streaming_core.utils import shutdown_requested  # noqa: E402
 from voice_assistant.agent import create_root_agent  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 from opentelemetry.trace import Link, SpanContext, TraceFlags  # noqa: E402
@@ -161,12 +162,45 @@ def process_request(connection, request):
 # 4. Voice session: one call of handle_client == one conversation
 # =============================================================================
 def _request_trace_links(headers) -> list[Link]:
-  """Span link to the Cloud Run request trace of the WebSocket handshake.
+  """[Observability #6] Link this call's trace to Cloud Run's request trace.
 
-  Cloud Run populates the W3C `traceparent` header; Google recommends it, with
-  the legacy `X-Cloud-Trace-Context` (TRACE_ID/DECIMAL_SPAN_ID;o=1) as fallback.
-  A LINK, not a parent: Cloud Run samples at most ~1 request / 10 s per
-  instance, and a parent's "not sampled" flag would drop most call traces.
+  WHAT THIS DOES
+    When the browser opens the WebSocket, Cloud Run (the platform in front of
+    this server) keeps its OWN small record of that HTTP request, and sends us
+    its tracking number in a request header. This function reads that number
+    and returns it as a "span link" that is attached to the call's
+    `voice_session` span in handle_client() below.
+
+  WHY IT MATTERS IN THE DESIGN
+    Two records describe the same call, and before this change nothing
+    connected them:
+      - Cloud Run's request record: shows problems AT THE FRONT DOOR -
+        slow WebSocket handshakes, 5xx errors from the load balancer,
+        connections rejected before our code even ran.
+      - Our `voice_session` trace: shows everything INSIDE the call - the
+        agent, each model turn, every FAQ search, errors.
+    With the link, someone looking at a bad request in Cloud Run can jump to
+    the full call trace (and back), instead of guessing by timestamps.
+
+  WHY A *LINK* AND NOT A *PARENT* (important - do not "simplify" this)
+    The obvious alternative is to make the call trace a CHILD of Cloud Run's
+    request. That would be wrong here: Cloud Run records only a sample of
+    requests - at most 0.1 requests per second per instance, i.e. about one
+    request every 10 seconds - and marks all the others "not sampled".
+    OpenTelemetry's default sampler obeys a parent's decision, so most of our
+    call traces would silently disappear. A link is a "see also" reference:
+    it connects the two traces without inheriting that sampling decision.
+    Source: https://docs.cloud.google.com/run/docs/trace ("Trace sampling rate")
+
+  WHICH HEADER
+    Google recommends the standard W3C `traceparent` header and says Cloud Run
+    fills it in automatically; the older `X-Cloud-Trace-Context` header is the
+    documented fallback. Its format is TRACE_ID/SPAN_ID;o=1 and - unlike
+    traceparent - the span id is DECIMAL, not hexadecimal, hence int(..., 10).
+    Source: https://docs.cloud.google.com/trace/docs/trace-context
+
+  Returns [] when neither header is present or valid (e.g. local runs), so the
+  call trace is simply created without a link - nothing else changes.
   """
   traceparent = headers.get("traceparent")
   if traceparent:
@@ -186,6 +220,8 @@ def _request_trace_links(headers) -> list[Link]:
 async def handle_client(websocket):
   # One root span per conversation: every ADK span (agent, model, tool) created
   # inside becomes a child, so Cloud Trace shows the whole call as one trace.
+  # [Observability #6] Attach the Cloud Run request trace as a link (see
+  # _request_trace_links above for why it is a link and not a parent).
   request = getattr(websocket, "request", None)
   links = _request_trace_links(request.headers) if request is not None else []
   with tracer.start_as_current_span("voice_session", links=links):
@@ -209,6 +245,10 @@ async def _handle_client(websocket):
           timezone = str(msg.get("timezone") or "")[:64] or None
           break
   except TimeoutError:
+    # [Observability #9c] Previously a silent `pass`. The timezone drives the
+    # greeting ("Good morning") and the date given to the model, so a call that
+    # fell back to DEFAULT_TIMEZONE can greet the caller wrongly. Logging it
+    # explains such reports and shows how often clients fail to send `init`.
     logger.info("No init message within %.0f s - using the default timezone", INIT_TIMEOUT_S)
   ctx = get_datetime_info(timezone)  # {"timezone","date","time","greeting"}
 
@@ -220,12 +260,22 @@ async def _handle_client(websocket):
   #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
   # TODO(security): no auth yet - derive user_id from a verified identity in prod.
   user_id, session_id = f"user_{client_id}", f"session_{client_id}"
+  # `call_span` is this call's `voice_session` span. It is kept in a variable
+  # because the cleanup block at the end of this function records why the call
+  # ended on it ([Observability #9c]).
   call_span = trace.get_current_span()
   call_span.set_attribute("session.id", session_id)  # match trace <-> transcript
   span_ctx = call_span.get_span_context()
   await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
   runner = Runner(app_name=APP_NAME, agent=create_root_agent(ctx), session_service=session_service)
-  # trace_id in the transcript = jump from a transcript to its trace in Cloud Trace.
+  # [Observability #8a] Put the call's trace ID into the transcript file.
+  # WHY: transcripts are what QA and complaint handling actually read. Before,
+  # going from "this customer had a bad call" to that call's technical timeline
+  # meant searching by time and guessing. Now the transcript's metadata.trace_id
+  # can be pasted straight into Cloud Trace to see the turns, timings, FAQ
+  # searches and errors of exactly that call. (session.id above already links
+  # the other way: trace -> transcript.) None when tracing is off (local runs);
+  # TranscriptLogger then leaves the field out.
   transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"],
                                 trace_id=f"{span_ctx.trace_id:032x}" if span_ctx.is_valid else None)
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
@@ -236,9 +286,19 @@ async def _handle_client(websocket):
   # Reads WebSocket messages and pushes them into the session's LiveRequestQueue:
   # mic audio chunks (base64 PCM16 16 kHz) and typed text. Returns on "end" or
   # when the browser disconnects (the async-for loop simply finishes).
-  # Client input that is dropped (malformed JSON, oversized / invalid base64
-  # audio) is counted and its first occurrence logged: silently lost audio is
-  # the usual cause of "the bot didn't hear me".
+  #
+  # [Observability #9c] Count client input that has to be thrown away.
+  # WHAT: a message that is not valid JSON, or an audio chunk that is too large
+  #   or not valid base64, cannot be used and is discarded (unchanged behaviour).
+  # WHY IT MATTERS: before, these were discarded SILENTLY. A discarded audio
+  #   chunk is a piece of the caller's speech that never reached Gemini, so the
+  #   only symptom was a complaint like "the bot didn't hear me" with no
+  #   evidence anywhere. Now each call keeps a count, which is written to the
+  #   call's span and its closing log line, and the FIRST drop of each kind is
+  #   logged as a WARNING.
+  # WHY ONLY THE FIRST: a broken client can send dozens of bad chunks per
+  #   second; one log line per chunk would flood Cloud Logging (and its bill).
+  #   One warning plus a total keeps the signal without the noise.
   dropped = {"invalid_message": 0, "invalid_audio": 0}
 
   def _drop(kind: str, what: str):
@@ -264,8 +324,8 @@ async def _handle_client(websocket):
       elif kind == "ping":
         await send({"type": "pong"})
       elif kind == "end":
-        return "client_end"
-    return "client_disconnect"
+        return "client_end"           # [#9c] the caller ended the call normally
+    return "client_disconnect"        # [#9c] the socket closed without "end" (network drop, tab closed)
 
   # --- 4d. DOWNSTREAM callback: Gemini -> browser.
   # LiveVoiceSession calls emit(type, **data) for everything the model does.
@@ -282,8 +342,24 @@ async def _handle_client(websocket):
   # Both directions must be live at the same time so the user can interrupt
   # (barge in) while the model is speaking. When either side finishes
   # (browser disconnects, "end", or a Live API error) we tear everything down.
-  # Why the call ended: client_end | client_disconnect | live_session_ended |
-  # error | server_shutdown. Recorded on the voice_session span and in the log.
+  #
+  # [Observability #9c] Record WHY every call ended.
+  # The possible values, and what each one means for the caller:
+  #   client_end          - the caller ended the call normally ("end" message)
+  #   client_disconnect   - the connection dropped without "end" (network
+  #                         problem, browser tab closed, phone lost signal)
+  #   live_session_ended  - the Gemini Live session finished on its own
+  #   error               - something failed in our code or the Live API
+  #   server_shutdown     - this server instance was stopped (e.g. Cloud Run
+  #                         sends SIGTERM during a deploy or scale-down)
+  # WHY IT MATTERS: before, every call ended with the same "Session X closed"
+  # line, so "how many calls drop unexpectedly?" - the most basic health
+  # question for a voice line - could not be answered. Now the reason is put on
+  # the voice_session span (attribute voice.close_reason), in the closing log
+  # line, and (via the observability add-on) on the voice.sessions metric, so
+  # it can be charted and alerted on. A rise in client_disconnect points to
+  # network problems; a rise in server_shutdown means deploys are cutting
+  # live calls.
   close_reason = "unknown"
   started = time.monotonic()
   tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
@@ -300,8 +376,17 @@ async def _handle_client(websocket):
         close_reason = task.result()
       else:
         close_reason = "live_session_ended"
+    # [#9c] During a shutdown the server closes every socket itself, which the
+    # lines above cannot tell apart from the caller dropping. The shutdown flag
+    # (see streaming_core/utils.py) makes the recorded reason truthful.
+    if shutdown_requested.is_set() and close_reason in ("client_disconnect", "live_session_ended"):
+      close_reason = "server_shutdown"
   except asyncio.CancelledError:
-    close_reason = "server_shutdown"  # e.g. SIGTERM on Cloud Run
+    # [#9c] This task was cancelled from outside - in practice the server is
+    # shutting down (Cloud Run sends SIGTERM and allows ~10 s before killing
+    # the container). Record it, then re-raise: cancellation must propagate so
+    # the shutdown can finish; the `finally` below still saves the transcript.
+    close_reason = "server_shutdown"
     raise
   except Exception:
     # Log full details server-side; send only a generic message to the client.
@@ -318,6 +403,11 @@ async def _handle_client(websocket):
     session.close()
     await transcript.save()  # dump once per session
     await websocket.close()
+    # [#9c] One summary per call: reason, length, and how much input was
+    # discarded. On the span it can be filtered in Trace Explorer; in the log
+    # line it is readable at a glance. Example:
+    #   Session session_ab12 closed (reason=client_end, duration=184.2s,
+    #   invalid_audio=0, invalid_messages=0)
     duration_s = time.monotonic() - started
     call_span.set_attributes({
         "voice.close_reason": close_reason,
