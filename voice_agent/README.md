@@ -44,8 +44,9 @@ gcloud auth login && gcloud auth application-default login
 ```
 - `Dockerfile` serves `static/` and `/ws` on one port; `.dockerignore`/`.gcloudignore` keep `.env` out.
 - `deploy.sh` enables the APIs, creates the `maxis-voice-agent` service account with least-privilege roles
-  (`aiplatform.user`, `discoveryengine.viewer`, `serviceusage.serviceUsageConsumer`, Telemetry
-  traces/metrics/logs writers, `storage.objectCreator` on the bucket), sets `ALLOWED_ORIGINS` to the
+  (`aiplatform.user`, `discoveryengine.viewer`, `serviceusage.serviceUsageConsumer`,
+  `telemetry.tracesWriter`, `monitoring.metricWriter`, `logging.logWriter`, `storage.objectCreator`
+  on the bucket), sets `ALLOWED_ORIGINS` to the
   service URL, and uses `--timeout 3600 --session-affinity --no-cpu-throttling` for long WebSocket calls.
 
 ## Observability (OpenTelemetry → Google Cloud)

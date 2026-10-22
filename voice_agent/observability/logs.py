@@ -103,7 +103,14 @@ class SpanErrorHandler(logging.Handler):
 
 
 class RedactResumptionHandle(logging.Filter):
-  """Replaces the Live API session resumption handle in ADK's log line."""
+  """Replaces the Live API session resumption handle in ADK's log line.
+
+  streaming_core/utils.py installs the same protection for every start-up path;
+  this copy covers the add-on used on its own. The shared marker attribute
+  makes whichever installs first the only one.
+  """
+
+  redacts_resumption_handle = True
 
   def filter(self, record: logging.LogRecord) -> bool:
     try:
@@ -136,7 +143,7 @@ def configure_logging() -> None:
   logging.captureWarnings(True)
 
   adk_live = logging.getLogger(_ADK_LIVE_LOGGER)
-  if not any(isinstance(f, RedactResumptionHandle) for f in adk_live.filters):
+  if not any(getattr(f, "redacts_resumption_handle", False) for f in adk_live.filters):
     adk_live.addFilter(RedactResumptionHandle())  # logger-level: applies before any handler
 
   for name in _NOISY_LOGGERS:

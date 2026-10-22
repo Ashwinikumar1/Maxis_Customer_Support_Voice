@@ -29,9 +29,21 @@ gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 
 
 # A new service account takes a few seconds to propagate in IAM: retry grants.
 retry() { for i in 1 2 3 4 5 6; do "$@" >/dev/null 2>&1 && return 0; sleep 10; done; "$@"; }
+# Telemetry roles: exactly the three Google's ADK instrumentation guide lists
+# (https://docs.cloud.google.com/stackdriver/docs/instrumentation/ai-agent-adk).
+# Three overlapping roles were removed - each one's permissions are already
+# covered (checked in https://docs.cloud.google.com/iam/docs/roles-permissions/):
+#   roles/cloudtrace.agent        - adds cloudtrace.traces.patch for the older Cloud Trace
+#                                   API; ADK exports traces to telemetry.googleapis.com,
+#                                   which needs only telemetry.traces.write (tracesWriter)
+#   roles/telemetry.logsWriter    - only logging.logEntries.create, included in logging.logWriter
+#   roles/telemetry.metricsWriter - only monitoring.timeSeries.create, included in
+#                                   monitoring.metricWriter
+# NOTE: this script only ADDS bindings; it never removes them. On a project that was
+# deployed before this change, the three removed roles stay granted until removed
+# by hand with `gcloud projects remove-iam-policy-binding`.
 for role in roles/aiplatform.user roles/discoveryengine.viewer roles/serviceusage.serviceUsageConsumer \
-            roles/telemetry.tracesWriter roles/telemetry.metricsWriter roles/telemetry.logsWriter \
-            roles/cloudtrace.agent roles/monitoring.metricWriter roles/logging.logWriter; do
+            roles/telemetry.tracesWriter roles/monitoring.metricWriter roles/logging.logWriter; do
   retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
     --role "$role" --condition None --quiet
 done

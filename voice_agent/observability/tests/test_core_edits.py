@@ -138,6 +138,48 @@ class LiveApiResumptionTests(unittest.TestCase):  # 10
     self.assertIs(span.attributes["live_api.resumable"], True)
     self.assertNotIn("SECRET-HANDLE", repr(dict(span.attributes)))
 
+  def test_handle_redacted_without_the_add_on(self):
+    """Plain `python server.py` path: only streaming_core is imported, no add-on.
+
+    Run in a separate process so nothing from the add-on (already imported by
+    this test run) can be what does the redaction.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parents[2]
+    script = (
+        "import logging, sys\n"
+        "import streaming_core.utils  # what server.py imports on every path\n"
+        "assert 'observability' not in sys.modules, 'add-on must not be loaded'\n"
+        "from google.genai import types\n"
+        "u = types.LiveServerSessionResumptionUpdate(new_handle='SECRET-HANDLE', resumable=True)\n"
+        "logging.getLogger('google_adk.google.adk.live._live_llm_flow')"
+        ".info(f'Update session resumption handle: {u}.')\n"
+    )
+    # cwd=app_dir puts the project on sys.path for `-c`; a minimal env keeps the
+    # parent's settings (and any add-on configuration) out of the child.
+    out = subprocess.run([sys.executable, "-c", script], cwd=app_dir, capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin"})
+    self.assertEqual(out.returncode, 0, out.stderr)
+    self.assertNotIn("SECRET-HANDLE", out.stderr)
+    self.assertIn("new_handle='[redacted]'", out.stderr)
+
+  def test_only_one_redaction_filter_with_the_add_on(self):
+    import streaming_core.utils  # noqa: F401  (installs its filter)
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = list(root.handlers), root.level
+    try:
+      logs.configure_logging()  # the add-on must see the marker and not add a second one
+      adk_logger = logging.getLogger(logs._ADK_LIVE_LOGGER)
+      redactors = [f for f in adk_logger.filters if getattr(f, "redacts_resumption_handle", False)]
+      self.assertEqual(len(redactors), 1)
+    finally:
+      root.handlers[:] = saved_handlers
+      root.setLevel(saved_level)
+
   def test_adk_log_line_has_handle_redacted(self):
     adk_logger = logging.getLogger(logs._ADK_LIVE_LOGGER)
     redact = logs.RedactResumptionHandle()
