@@ -8,6 +8,22 @@ cd "$(dirname "$0")"
 [[ -f .env ]] || { echo "Missing .env - copy .env.example to .env first"; exit 1; }
 set -a; source .env; set +a
 
+# -----------------------------------------------------------------------------
+# Dev-only guard (baseline CR-13, SC-11, IA-06)
+# This script is for a developer's own project. It builds from local source,
+# grants roles at project level and, by default, deploys a public service.
+# Test and production must instead go through the pipeline
+# (security/ci/cloudbuild-image.yaml): it scans the image, signs it, deploys by
+# digest with Binary Authorization, and IAM comes from security/terraform.
+# Set DEPLOY_ENV in .env; anything other than "dev" stops here, so the script
+# can't be pointed at a shared environment by mistake.
+# -----------------------------------------------------------------------------
+if [[ "${DEPLOY_ENV:-dev}" != "dev" ]]; then
+  echo "deploy.sh is for personal dev projects only (DEPLOY_ENV=${DEPLOY_ENV})."
+  echo "Deploy test and prod through security/ci/cloudbuild-image.yaml."
+  exit 1
+fi
+
 PROJECT="$GOOGLE_CLOUD_PROJECT"
 REGION="$CLOUD_RUN_REGION"
 SERVICE="$CLOUD_RUN_SERVICE"
@@ -75,6 +91,10 @@ ENV_VARS=(
   "SAFETY_BLOCK_THRESHOLD=${SAFETY_BLOCK_THRESHOLD:-BLOCK_MEDIUM_AND_ABOVE}"
   "WRITE_TOOLS_ENABLED=${WRITE_TOOLS_ENABLED:-false}"
   "MAX_SESSION_SECONDS=${MAX_SESSION_SECONDS:-1800}"
+  "SILENCE_TIMEOUT_SECONDS=${SILENCE_TIMEOUT_SECONDS:-120}"
+  "SILENCE_RMS_THRESHOLD=${SILENCE_RMS_THRESHOLD:-500}"
+  "IAP_AUDIENCE=${IAP_AUDIENCE:-}"
+  "REQUIRE_IAP=${REQUIRE_IAP:-false}"
   "REQUIRE_PERSISTENT_SESSIONS=${REQUIRE_PERSISTENT_SESSIONS:-false}"
 )
 # Secrets come from Secret Manager, never plain env vars: the HMAC key for security events and,
@@ -89,6 +109,10 @@ SECRET_ARGS=()
 # CLOUD_RUN_PUBLIC=false and CLOUD_RUN_INGRESS=internal-and-cloud-load-balancing.
 AUTH_FLAG="--allow-unauthenticated"
 [[ "${CLOUD_RUN_PUBLIC:-true}" == "false" ]] && AUTH_FLAG="--no-allow-unauthenticated"
+if [[ "$AUTH_FLAG" == "--allow-unauthenticated" ]]; then
+  # Say it out loud: anyone with the URL can open a call (and spend Gemini quota).
+  echo "WARNING: deploying a PUBLIC service. Set CLOUD_RUN_PUBLIC=false once IAP is in front."
+fi
 ENV_ARG="^@^$(IFS=@; echo "${ENV_VARS[*]}")"   # '@' delimiter: values may contain commas
 
 echo "== Deploy $SERVICE -> $SERVICE_URL"

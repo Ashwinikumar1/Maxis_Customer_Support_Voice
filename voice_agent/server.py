@@ -50,6 +50,9 @@ from streaming_core import (  # noqa: E402
 from voice_assistant.agent import create_root_agent  # noqa: E402
 from guardrails import (  # noqa: E402
     RedactingTranscriptLogger, build_plugins, make_session_service, security_event)
+from guardrails.call_limits import SilenceWatch  # noqa: E402
+from guardrails.events import hash_id  # noqa: E402
+from guardrails.identity import IdentityError, identify, verifier_from_env  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 
 
@@ -105,6 +108,13 @@ MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "1800"))  # end calls
 # Persistent when SESSION_DB_URL is set (guardrails.sessions); in-memory otherwise.
 session_service = make_session_service()
 
+# Identity check for /ws (guardrails/identity.py). When IAP_AUDIENCE is set, every WebSocket must
+# carry a valid signed IAP header, checked twice: once in process_request (so a bad request is
+# refused with HTTP 401 before the WebSocket is even opened) and again in the handler, where the
+# verified identity becomes the ADK user_id. Built once at start-up: it caches Google's IAP keys
+# for all connections. With REQUIRE_IAP=true and no audience, this line stops the server starting.
+iap_verifier = verifier_from_env()
+
 # =============================================================================
 # 3. Static UI serving (plain HTTP on the same port as the WebSocket)
 # -----------------------------------------------------------------------------
@@ -135,19 +145,33 @@ def _http(status: HTTPStatus, body: bytes, ctype: str = "text/plain; charset=utf
   return Response(status.value, status.phrase, headers, body)
 
 
-def process_request(connection, request):
+async def process_request(connection, request):
   """Runs on EVERY incoming HTTP request, before any WebSocket handshake.
 
-  - "/ws"  -> check the Origin header, then return None so the WebSocket
-              handshake continues and `handle_client` is called.
+  - "/ws"  -> check the Origin header, then (when IAP is on) the signed IAP
+              identity header, then return None so the WebSocket handshake
+              continues and `handle_client` is called.
   - other  -> answer as a normal web server (UI files) or 404.
   Note: websockets logs these HTTP answers as "connection rejected (200 OK)";
   that is expected and just means a file was served.
+
+  It is async because the IAP check may need to download Google's signing keys
+  (about once an hour); websockets awaits it, so other calls keep running.
+  The UI files themselves are not checked here: they hold no data, and IAP at
+  the load balancer already decides who can load the page.
   """
   path = request.path.split("?", 1)[0]
   if path == "/ws":
     if request.headers.get("Origin") not in ALLOWED_ORIGINS:  # cross-site WS hijacking
       return _http(HTTPStatus.FORBIDDEN, b"Forbidden")
+    try:
+      # With IAP off this returns an anonymous caller at once; the result is not
+      # kept here (the handler checks again and uses its own result).
+      await identify(iap_verifier, request.headers, anonymous_id="handshake")
+    except IdentityError:
+      # 401 with no detail: the reason is in the security event, not in the
+      # response, so a probing client learns nothing about why it failed.
+      return _http(HTTPStatus.UNAUTHORIZED, b"Unauthorized")
     return None  # continue WebSocket handshake
   name = _ROUTES.get(path)
   if not name:
@@ -169,6 +193,13 @@ async def handle_client(websocket):
 async def _handle_client(websocket):
   client_id = uuid.uuid4().hex  # random, unguessable id for this connection
   send = lambda payload: websocket.send(json.dumps(payload))  # noqa: E731
+
+  async def notify(text: str) -> None:
+    """Best-effort notice to the caller; the browser may already have gone."""
+    try:
+      await send({"type": "error", "message": text})
+    except ConnectionClosed:
+      pass
   await send({"type": "ready"})
 
   # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone.
@@ -192,17 +223,38 @@ async def _handle_client(websocket):
   #   create_root_agent(ctx)         -> new agent tree with today's date/greeting
   #   RedactingTranscriptLogger      -> collects turns, redacted then uploaded to GCS at the end
   #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
-  # TODO(security): no auth yet - derive user_id from a verified identity in prod.
-  user_id, session_id = f"user_{client_id}", f"session_{client_id}"
-  trace.get_current_span().set_attribute("session.id", session_id)  # match trace <-> transcript
+  #
+  # Who is calling (guardrails/identity.py): with IAP on, user_id comes from the
+  # verified IAP header ("iap_" + a hash of Google's account ID), never from
+  # anything the client or the model says. With IAP off (local dev), it is the
+  # random connection ID, as before. The handshake already checked the header;
+  # checking again here costs microseconds (keys are cached) and means the
+  # identity used below can only come from a header that verified.
+  try:
+    caller = await identify(iap_verifier, websocket.request.headers, anonymous_id=client_id)
+  except IdentityError:
+    await websocket.close(code=1008, reason="unauthorized")  # 1008 = policy violation
+    return
+  user_id, session_id = caller.user_id, f"session_{client_id}"
+  # session_ref is the keyed hash of the session ID (guardrails.events.hash_id).
+  # Logs, traces, security events and the transcript's metadata all use this
+  # same value, so they can be joined without raw IDs in ordinary logs (LM-07).
+  session_ref = hash_id(session_id)
+  trace.get_current_span().set_attribute("session.ref", session_ref)  # match trace <-> transcript
   await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
   # Guardrail plugins run on every model and tool call: tool policy, injection flag, Model Armor.
   app = App(name=APP_NAME, root_agent=create_root_agent(ctx), plugins=build_plugins())
   runner = Runner(app=app, session_service=session_service)
-  transcript = RedactingTranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"])
+  transcript = RedactingTranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"],
+                                         session_ref=session_ref, caller_verified=caller.verified)
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
                              run_config=default_run_config(VOICE_NAME), transcript=transcript)
-  logger.info("Session %s started (%s)", session_id, ctx["timezone"])
+  logger.info("Session %s started (%s, verified=%s)", session_ref, ctx["timezone"], caller.verified)
+
+  # Silence limit (guardrails/call_limits.py): ends the call after
+  # SILENCE_TIMEOUT_SECONDS (default 120) in which neither side said anything.
+  # upstream() reports caller audio and text, emit() reports agent output.
+  silence = SilenceWatch()
 
   # --- 4c. UPSTREAM task: browser -> Gemini.
   # Reads WebSocket messages and pushes them into the session's LiveRequestQueue:
@@ -213,8 +265,11 @@ async def _handle_client(websocket):
       msg = _parse(raw)
       kind = msg.get("type")
       if kind == "audio":
-        session.send_audio(_b64(msg.get("data")))
+        pcm = _b64(msg.get("data"))
+        silence.caller_audio(pcm)  # counts only frames loud enough to be speech
+        session.send_audio(pcm)
       elif kind == "text":
+        silence.activity()  # typing counts as the caller being there
         session.send_text(str(msg.get("data", "")))
       elif kind == "ping":
         await send({"type": "pong"})
@@ -227,6 +282,10 @@ async def _handle_client(websocket):
   # base64-encoded, every other event is forwarded as-is. A telephony channel
   # (e.g. Genesys) would provide its own emit() with audio format conversion.
   async def emit(kind, **data):
+    # Agent audio and either side's transcript mean the call is live: restart the
+    # silence period, so a caller listening to a long answer is never cut off.
+    if kind in ("audio", "transcript"):
+      silence.activity()
     if kind == "audio":
       await send({"type": "audio", "data": base64.b64encode(data["data"]).decode()})
     else:
@@ -234,24 +293,31 @@ async def _handle_client(websocket):
 
   # --- 4e. Run upstream and downstream CONCURRENTLY.
   # Both directions must be live at the same time so the user can interrupt
-  # (barge in) while the model is speaking. When either side finishes
-  # (browser disconnects, "end", or a Live API error) we tear everything down.
-  tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
+  # (barge in) while the model is speaking. When any task finishes
+  # (browser disconnects, "end", a Live API error, or the silence watchdog
+  # returning) we tear everything down. The `timeout` is the hard cap on call
+  # length: if it passes, `done` comes back empty.
+  watchdog = asyncio.create_task(silence.watch())
+  tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit)), watchdog]
   try:
     done, _ = await asyncio.wait(tasks, timeout=MAX_SESSION_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+    # Tell the caller why the call is ending. The UI shows "error" messages as a
+    # notice, so no browser change is needed. A phone channel would play a
+    # scripted goodbye instead (specs/genesys-endpoint-spec.md).
     if not done:
       security_event("session_time_limit", session=session_id, count=MAX_SESSION_SECONDS)
+      await notify("The call has reached its time limit and will end now.")
+    elif watchdog in done:
+      logger.info("Session %s ended after %.0f s of silence", session_ref, silence.quiet_for())
+      await notify("The call ended because no one spoke for a while.")
     for task in done:
       exc = task.exception()
       if exc and not isinstance(exc, ConnectionClosed):  # a normal disconnect is not an error
         raise exc
   except Exception:
     # Log full details server-side; send only a generic message to the client.
-    logger.exception("Session %s failed", session_id)
-    try:
-      await send({"type": "error", "message": "The voice session ended unexpectedly."})
-    except ConnectionClosed:
-      pass
+    logger.exception("Session %s failed", session_ref)
+    await notify("The voice session ended unexpectedly.")
   finally:
     # --- 4f. Cleanup (always runs): stop both tasks, close the Live connection,
     # upload the transcript ONCE to GCS, then close the browser socket.
@@ -260,7 +326,7 @@ async def _handle_client(websocket):
     session.close()
     await transcript.save()  # dump once per session
     await websocket.close()
-    logger.info("Session %s closed", session_id)
+    logger.info("Session %s closed", session_ref)
 
 
 # =============================================================================
@@ -294,8 +360,11 @@ def _b64(raw) -> bytes:
 # max_size caps a single WebSocket message at 1 MB.
 # =============================================================================
 async def main():
-  logger.info("Voice agent on http://%s:%s (project=%s, vertex=%s)", HOST, PORT,
-              os.getenv("GOOGLE_CLOUD_PROJECT"), os.getenv("GOOGLE_GENAI_USE_VERTEXAI"))
+  # The model name is logged at start-up so every revision's logs record exactly which
+  # model it ran (AI-01); the approved list is enforced by security/policy_checks.
+  logger.info("Voice agent on http://%s:%s (project=%s, vertex=%s, model=%s)", HOST, PORT,
+              os.getenv("GOOGLE_CLOUD_PROJECT"), os.getenv("GOOGLE_GENAI_USE_VERTEXAI"),
+              os.getenv("VOICE_AGENT_MODEL", "gemini-3.8-live"))
   async with serve(handle_client, HOST, PORT, process_request=process_request,
                    ping_interval=30, close_timeout=30, max_size=1 << 20) as server:
     await server.serve_forever()

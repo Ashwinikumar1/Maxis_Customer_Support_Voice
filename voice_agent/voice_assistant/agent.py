@@ -15,6 +15,9 @@ from guardrails import generate_content_config
 from .faq_search_tool import search_knowledge_base
 from .prompts import orchestrator_instruction
 
+# One exact model per release (AI-01). The default here and VOICE_AGENT_MODEL in .env.example must
+# both be on the approved list in security/policy_checks/policy.json, or the build fails: changing
+# the model is a reviewed change, because a different model can behave differently under attack.
 LIVE_MODEL = os.getenv("VOICE_AGENT_MODEL", "gemini-3.8-live")
 
 

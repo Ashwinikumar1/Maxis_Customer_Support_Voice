@@ -37,6 +37,16 @@ def _hash(value: str) -> str:
   return "u_" + hashlib.sha256(value.encode()).hexdigest()[:22]
 
 
+def hash_id(value: str) -> str:
+  """The same keyed hash the events use, for ordinary log lines and trace attributes (LM-07).
+
+  Using one function everywhere means a session hash in an application log, a security event,
+  a trace and the transcript's metadata all match, so the SOC can join them without anyone
+  needing the raw session, account or line ID.
+  """
+  return _hash(str(value))
+
+
 def build_event(name: str, **fields: Any) -> dict:
   event: dict[str, Any] = {
       "security_event": name,

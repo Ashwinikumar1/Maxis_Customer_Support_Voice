@@ -10,6 +10,8 @@ Everything the model may do passes through code here, never through the prompt a
   redaction.py      Transcript redaction before storage, with spoken-number normalisation (DP-08..11)
   events.py         Structured security events for the SOC, with no personal data (AP-18, LM-13)
   sessions.py       Persistent session store factory (AG-07)
+  identity.py       Caller identity from the signed IAP header on /ws, never from the client (CR-02, AG-03)
+  call_limits.py    Silence watchdog that ends calls nobody is speaking on (AP-11)
 
 See security/README.md at the repository root for how these map to the security baseline.
 """
