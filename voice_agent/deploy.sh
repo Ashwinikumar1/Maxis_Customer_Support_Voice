@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Deploys the Maxis voice agent (UI + WebSocket API) to Cloud Run with OpenTelemetry
-# (traces, metrics, logs -> Google Cloud).
+# (traces, metrics, logs -> Google Cloud) and the observability launcher.
+# ONE script does everything, step by step: APIs -> service account + IAM ->
+# bucket access -> build (./Dockerfile) + deploy with all env vars.
 # All settings come from .env (see .env.example).  Usage:  cd voice_agent && ./deploy.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,6 +18,8 @@ SA="${CLOUD_RUN_SERVICE_ACCOUNT}@${PROJECT}.iam.gserviceaccount.com"
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
 # Cloud Run's deterministic URL: the only browser origin allowed to open /ws.
 SERVICE_URL="https://${SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
+# Deployed version = short git commit (falls back to a timestamp outside a git clone).
+VERSION="$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)"
 
 echo "== APIs"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
@@ -64,16 +68,32 @@ ENV_VARS=(
   "FAQ_SEARCH_ENGINE_ID=$FAQ_SEARCH_ENGINE_ID"
   "GCS_BUCKET=${GCS_BUCKET:-}"
   "GCS_LOG_PREFIX=$GCS_LOG_PREFIX"
-  "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=$ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
+  "ALLOWED_ORIGINS=$SERVICE_URL"
+  # [Observability] Logging and privacy settings. They used to be added by a
+  # second script (observability/deploy.sh). They live here now because
+  # --set-env-vars below DELETES every variable not in this list
+  # (https://docs.cloud.google.com/run/docs/configuring/services/environment-variables),
+  # so this one list must hold everything the service needs.
+  # Values from .env win; the defaults are the safe ones.
+  "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=${ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS:-false}"   # true = caller speech in spans (PII)
+  "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=${OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT:-NO_CONTENT}"
+  "LOG_FORMAT=${LOG_FORMAT:-json}"     # JSON lines -> structured, trace-linked Cloud Logging entries
+  "LOG_LEVEL=${LOG_LEVEL:-INFO}"
   # [Observability #13] Trace sampling - every call by default; see .env.example for why.
   "OTEL_TRACES_SAMPLER=${OTEL_TRACES_SAMPLER:-parentbased_always_on}"
-  "ALLOWED_ORIGINS=$SERVICE_URL"
+  # Tags every span, metric and log with the region and the deployed git commit,
+  # so a problem can be tied to the release that introduced it.
+  "OTEL_RESOURCE_ATTRIBUTES=cloud.region=$REGION,service.version=$VERSION"
 )
 # The sampling rate only applies to ratio samplers; pass it only when it is set.
 if [[ -n "${OTEL_TRACES_SAMPLER_ARG:-}" ]]; then
   ENV_VARS+=("OTEL_TRACES_SAMPLER_ARG=$OTEL_TRACES_SAMPLER_ARG")
+fi
+# Google's recommended GenAI semantic conventions: opt in from .env after a staging check.
+if [[ -n "${OTEL_SEMCONV_STABILITY_OPT_IN:-}" ]]; then
+  ENV_VARS+=("OTEL_SEMCONV_STABILITY_OPT_IN=$OTEL_SEMCONV_STABILITY_OPT_IN")
 fi
 ENV_ARG="^@^$(IFS=@; echo "${ENV_VARS[*]}")"   # '@' delimiter: values may contain commas
 

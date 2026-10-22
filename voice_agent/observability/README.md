@@ -1,8 +1,7 @@
 # Observability add-on
 
-Closes the tracing and logging gaps that can be fixed **without editing any existing file**.
-`server.py`, `streaming_core/`, `voice_assistant/`, `Dockerfile`, `deploy.sh`, `pyproject.toml`
-and `.env.example` are untouched; no new dependencies.
+Closes the tracing and logging gaps in the voice agent. It is part of the main image:
+`../Dockerfile` copies this package and starts the server through it. No new dependencies.
 
 ## Run
 
@@ -11,13 +10,8 @@ cd voice_agent
 uv run python -m observability        # instead of: uv run python server.py
 ```
 
-Deploy (after `./deploy.sh` has created the service at least once):
-
-```bash
-./observability/deploy.sh             # builds observability/Dockerfile, rolls it onto the same service
-```
-
-Running `./deploy.sh` again puts the plain image back; run `./observability/deploy.sh` after it.
+Deploy: just `./deploy.sh`. It builds `../Dockerfile` (which includes this add-on) and sets
+all of its env vars in one step. There is no separate observability deploy any more.
 
 ## What it adds
 
