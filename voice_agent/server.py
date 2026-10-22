@@ -38,16 +38,18 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())  # macOS CA bundle for Live API
 
+from google.adk.apps import App  # noqa: E402
 from google.adk.runners import Runner  # noqa: E402
-from google.adk.sessions import InMemorySessionService  # noqa: E402
 from websockets.asyncio.server import serve  # noqa: E402
 from websockets.datastructures import Headers  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.http11 import Response  # noqa: E402
 
 from streaming_core import (  # noqa: E402
-    LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
+    LiveVoiceSession, default_run_config, get_datetime_info, logger)
 from voice_assistant.agent import create_root_agent  # noqa: E402
+from guardrails import (  # noqa: E402
+    RedactingTranscriptLogger, build_plugins, make_session_service, security_event)
 from opentelemetry import trace  # noqa: E402
 
 
@@ -96,11 +98,12 @@ ALLOWED_ORIGINS = {
 }
 INIT_TIMEOUT_S = 5.0        # how long to wait for the client's {"type":"init"} message
 MAX_B64_LEN = 512 * 1024    # reject oversized audio frames (DoS protection)
+MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "1800"))  # end calls after 30 min (AP-11)
 
 # ADK SessionService stores conversation history/state per session.
 # Created ONCE and shared by all connections (per ADK custom-server guidance).
-# TODO: use a persistent SessionService (e.g. DatabaseSessionService) in production.
-session_service = InMemorySessionService()
+# Persistent when SESSION_DB_URL is set (guardrails.sessions); in-memory otherwise.
+session_service = make_session_service()
 
 # =============================================================================
 # 3. Static UI serving (plain HTTP on the same port as the WebSocket)
@@ -187,14 +190,16 @@ async def _handle_client(websocket):
   #   session_service.create_session -> fresh ADK session (history + state=ctx)
   #   Runner                         -> executes the agent tree for this session
   #   create_root_agent(ctx)         -> new agent tree with today's date/greeting
-  #   TranscriptLogger               -> collects turns, uploaded to GCS at the end
+  #   RedactingTranscriptLogger      -> collects turns, redacted then uploaded to GCS at the end
   #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
   # TODO(security): no auth yet - derive user_id from a verified identity in prod.
   user_id, session_id = f"user_{client_id}", f"session_{client_id}"
   trace.get_current_span().set_attribute("session.id", session_id)  # match trace <-> transcript
   await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
-  runner = Runner(app_name=APP_NAME, agent=create_root_agent(ctx), session_service=session_service)
-  transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"])
+  # Guardrail plugins run on every model and tool call: tool policy, injection flag, Model Armor.
+  app = App(name=APP_NAME, root_agent=create_root_agent(ctx), plugins=build_plugins())
+  runner = Runner(app=app, session_service=session_service)
+  transcript = RedactingTranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"])
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
                              run_config=default_run_config(VOICE_NAME), transcript=transcript)
   logger.info("Session %s started (%s)", session_id, ctx["timezone"])
@@ -233,7 +238,9 @@ async def _handle_client(websocket):
   # (browser disconnects, "end", or a Live API error) we tear everything down.
   tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
   try:
-    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    done, _ = await asyncio.wait(tasks, timeout=MAX_SESSION_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+    if not done:
+      security_event("session_time_limit", session=session_id, count=MAX_SESSION_SECONDS)
     for task in done:
       exc = task.exception()
       if exc and not isinstance(exc, ConnectionClosed):  # a normal disconnect is not an error

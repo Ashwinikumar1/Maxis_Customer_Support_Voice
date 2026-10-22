@@ -17,6 +17,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # App code + UI.
 COPY streaming_core ./streaming_core
 COPY voice_assistant ./voice_assistant
+COPY guardrails ./guardrails
 COPY static ./static
 COPY server.py ./
 

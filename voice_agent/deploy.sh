@@ -35,6 +35,17 @@ for role in roles/aiplatform.user roles/discoveryengine.viewer roles/serviceusag
   retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
     --role "$role" --condition None --quiet
 done
+# Guardrails (voice_agent/guardrails): Model Armor and Sensitive Data Protection, only when configured.
+if [[ -n "${MODEL_ARMOR_PROMPT_TEMPLATE:-}${MODEL_ARMOR_RESPONSE_TEMPLATE:-}" ]]; then
+  gcloud services enable modelarmor.googleapis.com --project "$PROJECT"
+  retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
+    --role roles/modelarmor.user --condition None --quiet
+fi
+if [[ -n "${DLP_INSPECT_TEMPLATE:-}${DLP_DEIDENTIFY_TEMPLATE:-}" ]]; then
+  gcloud services enable dlp.googleapis.com --project "$PROJECT"
+  retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
+    --role roles/dlp.user --condition None --quiet
+fi
 if [[ -n "${GCS_BUCKET:-}" ]]; then
   retry gcloud storage buckets add-iam-policy-binding "gs://$GCS_BUCKET" \
     --member "serviceAccount:$SA" --role roles/storage.objectCreator --quiet
@@ -56,7 +67,28 @@ ENV_VARS=(
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
   "ALLOWED_ORIGINS=$SERVICE_URL"
+  "MODEL_ARMOR_PROMPT_TEMPLATE=${MODEL_ARMOR_PROMPT_TEMPLATE:-}"
+  "MODEL_ARMOR_RESPONSE_TEMPLATE=${MODEL_ARMOR_RESPONSE_TEMPLATE:-}"
+  "MODEL_ARMOR_MODE=${MODEL_ARMOR_MODE:-inspect}"
+  "DLP_INSPECT_TEMPLATE=${DLP_INSPECT_TEMPLATE:-}"
+  "DLP_DEIDENTIFY_TEMPLATE=${DLP_DEIDENTIFY_TEMPLATE:-}"
+  "SAFETY_BLOCK_THRESHOLD=${SAFETY_BLOCK_THRESHOLD:-BLOCK_MEDIUM_AND_ABOVE}"
+  "WRITE_TOOLS_ENABLED=${WRITE_TOOLS_ENABLED:-false}"
+  "MAX_SESSION_SECONDS=${MAX_SESSION_SECONDS:-1800}"
+  "REQUIRE_PERSISTENT_SESSIONS=${REQUIRE_PERSISTENT_SESSIONS:-false}"
 )
+# Secrets come from Secret Manager, never plain env vars: the HMAC key for security events and,
+# when used, the session database URL (secret names from `terraform output app_env`).
+SECRETS=()
+[[ -n "${SECURITY_EVENT_HMAC_KEY_SECRET:-}" ]] && SECRETS+=("SECURITY_EVENT_HMAC_KEY=${SECURITY_EVENT_HMAC_KEY_SECRET}:latest")
+[[ -n "${SESSION_DB_URL_SECRET:-}" ]] && SECRETS+=("SESSION_DB_URL=${SESSION_DB_URL_SECRET}:latest")
+SECRET_ARGS=()
+(( ${#SECRETS[@]} )) && SECRET_ARGS=(--set-secrets "$(IFS=,; echo "${SECRETS[*]}")")
+
+# Public demo by default. Behind the load balancer and IAP (security/terraform): set
+# CLOUD_RUN_PUBLIC=false and CLOUD_RUN_INGRESS=internal-and-cloud-load-balancing.
+AUTH_FLAG="--allow-unauthenticated"
+[[ "${CLOUD_RUN_PUBLIC:-true}" == "false" ]] && AUTH_FLAG="--no-allow-unauthenticated"
 ENV_ARG="^@^$(IFS=@; echo "${ENV_VARS[*]}")"   # '@' delimiter: values may contain commas
 
 echo "== Deploy $SERVICE -> $SERVICE_URL"
@@ -66,11 +98,11 @@ echo "== Deploy $SERVICE -> $SERVICE_URL"
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --service-account "$SA" \
-  --allow-unauthenticated \
+  "$AUTH_FLAG" --ingress "${CLOUD_RUN_INGRESS:-all}" \
   --timeout 3600 --session-affinity --no-cpu-throttling \
   --cpu 2 --memory 1Gi --concurrency 20 \
   --min-instances "$CLOUD_RUN_MIN_INSTANCES" --max-instances "$CLOUD_RUN_MAX_INSTANCES" \
-  --set-env-vars "$ENV_ARG"
+  --set-env-vars "$ENV_ARG" "${SECRET_ARGS[@]}"
 
 echo
 echo "UI:     $SERVICE_URL"

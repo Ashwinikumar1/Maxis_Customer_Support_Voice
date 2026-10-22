@@ -10,6 +10,8 @@ from datetime import datetime
 
 from google.adk.agents import Agent
 
+from guardrails import generate_content_config
+
 from .faq_search_tool import search_knowledge_base
 from .prompts import orchestrator_instruction
 
@@ -24,6 +26,7 @@ def create_root_agent(ctx: dict | None = None) -> Agent:
       description="Maxis virtual agent: greets callers, answers general Maxis questions.",
       instruction=orchestrator_instruction(today),
       tools=[search_knowledge_base],
+      generate_content_config=generate_content_config(),  # Gemini safety filters (AI-03)
       # sub_agents=[roaming_agent],  # TODO: add when the roaming flow is built
   )
 
