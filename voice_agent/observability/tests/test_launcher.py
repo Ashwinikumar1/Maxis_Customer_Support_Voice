@@ -45,6 +45,48 @@ class LauncherEndToEnd(unittest.TestCase):
     return subprocess.Popen([sys.executable, "-m", "observability.tests._harness"], cwd=APP_DIR, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+  def test_load_test_script_against_the_real_server(self):
+    """scripts/load_test.py run against the real server (model faked): 8 callers
+    must all be answered, and the server must see clean calls with no dropped audio."""
+    port = _free_port()
+    spans_file = Path(tempfile.mkdtemp()) / "spans.jsonl"
+    proc = self._start(port, spans_file, OBS_TEST_FAKE_LIVE="1")
+    try:
+      self._wait_up(port)
+      run = subprocess.run([sys.executable, "scripts/load_test.py", "--url", f"http://127.0.0.1:{port}",
+                            "--calls", "8", "--ramp", "1", "--duration", "3"],
+                           cwd=APP_DIR, capture_output=True, text=True, timeout=60)
+      proc.send_signal(signal.SIGTERM)
+      out, _ = proc.communicate(timeout=15)
+    finally:
+      if proc.poll() is None:
+        proc.kill()
+    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+    self.assertIn("calls answered  : 8/8", run.stdout)
+    self.assertIn("RESULT: PASS", run.stdout)
+    closed = [json.loads(l)["message"] for l in out.splitlines()
+              if l.startswith("{") and " closed (" in json.loads(l)["message"]]
+    self.assertEqual(len(closed), 8)
+    self.assertTrue(all("reason=client_end" in m and "invalid_audio=0" in m for m in closed), closed)
+
+  def test_load_test_script_reports_failures(self):
+    """Without a working model (no Google credentials) every call fails: the
+    script must say FAIL and give the reason, never report a false PASS."""
+    port = _free_port()
+    proc = self._start(port, Path(tempfile.mkdtemp()) / "spans.jsonl")
+    try:
+      self._wait_up(port)
+      run = subprocess.run([sys.executable, "scripts/load_test.py", "--url", f"http://127.0.0.1:{port}",
+                            "--calls", "2", "--ramp", "0", "--duration", "5", "--greeting-timeout", "3"],
+                           cwd=APP_DIR, capture_output=True, text=True, timeout=60)
+    finally:
+      proc.send_signal(signal.SIGTERM)
+      proc.communicate(timeout=15)
+    self.assertEqual(run.returncode, 1, run.stdout)
+    self.assertIn("calls failed    : 2", run.stdout)
+    self.assertIn("server error", run.stdout)
+    self.assertIn("RESULT: FAIL", run.stdout)
+
   def test_sampling_off_keeps_metrics_and_log_session_ids(self):
     """[#13] With trace sampling fully off, nothing about a call may go missing
     except its trace: call metrics stay complete and every log line of a call

@@ -75,10 +75,46 @@ def _hang_live_sessions():
   live_session.LiveVoiceSession.run = run
 
 
+def _fake_live_sessions():
+  """OBS_TEST_FAKE_LIVE=1: a stand-in for Gemini Live, used to test scripts/load_test.py.
+
+  Greets with one audio chunk + turn_complete, then answers every typed
+  question with one audio chunk after 0.3 s. The server, WebSocket protocol,
+  audio streaming and telemetry are all real; only the model is faked.
+  """
+  import asyncio
+
+  from streaming_core import live_session
+
+  original_send_text = live_session.LiveVoiceSession.send_text
+
+  def send_text(self, text):
+    original_send_text(self, text)
+    if getattr(self, "_fake_question", None) is not None:
+      self._fake_question.set()
+
+  async def run(self, emit):
+    self._fake_question = asyncio.Event()
+    await asyncio.sleep(0.2)
+    await emit("audio", data=bytes(4800))           # greeting
+    await emit("turn_complete", state="IDLE")
+    while True:
+      await self._fake_question.wait()
+      self._fake_question.clear()
+      await asyncio.sleep(0.3)                       # "model thinking"
+      await emit("audio", data=bytes(4800))         # answer
+      await emit("turn_complete", state="IDLE")
+
+  live_session.LiveVoiceSession.send_text = send_text
+  live_session.LiveVoiceSession.run = run
+
+
 def _install():
   _install_with_file_exporter()
   if os.getenv("OBS_TEST_HANG_SESSION") == "1":
     _hang_live_sessions()
+  if os.getenv("OBS_TEST_FAKE_LIVE") == "1":
+    _fake_live_sessions()
 
 
 launcher.install = _install
