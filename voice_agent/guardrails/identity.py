@@ -28,7 +28,16 @@ What the app does with the result
 ---------------------------------
 `user_id` becomes "iap_" + a hash of `sub`. The ADK session store and the logs therefore never
 hold the tester's email or raw account ID, but every call by the same person shares one user_id,
-which is what an investigation needs. The email is read only to log its domain on refusal.
+which is what an investigation needs. The token's `email` claim is not used at all.
+
+Where the keys come from
+------------------------
+Google publishes the keys at www.gstatic.com. Inside the VPC Service Controls design
+(security/terraform/modules/network), Cloud Run's egress goes only to restricted.googleapis.com,
+which does not serve gstatic.com, and Google's IAP docs warn that "a VPC Service Controls perimeter
+can prevent direct access to the public URL for the keys". IAP_KEYS_URL therefore accepts either
+the public https URL (default) or a gs://bucket/object copy of the same JSON inside the
+perimeter, which is what Google suggests for that case.
 
 When IAP_AUDIENCE is empty (local development, or the public demo before the edge exists) the
 check is off and callers get a random anonymous ID, exactly as before. Set REQUIRE_IAP=true in
@@ -46,6 +55,8 @@ import time
 import urllib.request
 from dataclasses import dataclass
 
+from google.auth import jwt
+
 from .events import hash_id, security_event
 
 log = logging.getLogger(__name__)
@@ -53,6 +64,7 @@ log = logging.getLogger(__name__)
 IAP_HEADER = "x-goog-iap-jwt-assertion"
 IAP_ISSUER = "https://cloud.google.com/iap"
 IAP_KEYS_URL = "https://www.gstatic.com/iap/verify/public_key"
+IAP_ALGORITHM = "ES256"  # the only algorithm IAP signs with (IAP docs: "Securing your app with signed headers")
 # Google rotates IAP keys; refetching hourly picks up new keys well before old ones are retired.
 KEYS_TTL_SECONDS = 3600
 CLOCK_SKEW_SECONDS = 30
@@ -95,9 +107,22 @@ class IapVerifier:
     return bool(self.audience)
 
   def _download_keys(self) -> dict[str, str]:
-    # Plain HTTPS GET of a public JSON document: {"<key id>": "<PEM public key>", ...}.
+    # The document is JSON: {"<key id>": "<PEM public key>", ...}. The perimeter copy written by
+    # security/jobs/iap_keys_mirror also holds a "_removed_at" bookkeeping object; only string
+    # values are keys, so anything else is dropped here.
+    return {k: v for k, v in self._read_document().items() if isinstance(v, str)}
+
+  def _read_document(self) -> dict:
+    if self.keys_url.startswith("gs://"):
+      # A copy inside the perimeter, read with the service account's own credentials.
+      from google.cloud import storage
+
+      bucket, _, blob = self.keys_url[len("gs://"):].partition("/")
+      return json.loads(storage.Client().bucket(bucket).blob(blob).download_as_bytes(timeout=5))
+    if not self.keys_url.startswith("https://"):
+      raise ValueError("IAP_KEYS_URL must be https:// or gs://")
     # urllib verifies the server certificate by default; the certifi bundle is set in server.py.
-    with urllib.request.urlopen(self.keys_url, timeout=5) as resp:  # noqa: S310 (fixed https URL)
+    with urllib.request.urlopen(self.keys_url, timeout=5) as resp:  # noqa: S310 (https only, checked above)
       return json.loads(resp.read())
 
   async def _current_keys(self) -> dict[str, str]:
@@ -120,11 +145,18 @@ class IapVerifier:
     token = headers.get(IAP_HEADER)
     if not token:
       raise IdentityError("iap_header_missing")
+    # Check the token's header before anything else, as Google's IAP docs list it first: the
+    # algorithm must be IAP's ES256 and a key ID must be present. Refusing other algorithms means
+    # a token can never pick a weaker way of being verified.
+    try:
+      header = jwt.decode_header(token)
+    except Exception as exc:  # malformed base64 or JSON
+      raise IdentityError("iap_invalid:malformed_header") from exc
+    if header.get("alg") != IAP_ALGORITHM or not header.get("kid"):
+      raise IdentityError("iap_wrong_algorithm_or_kid")
     keys = await self._current_keys()
     # google.auth.jwt.decode checks the signature against the key named in the token's `kid`,
     # the audience, and exp/iat (with the allowed skew). It raises ValueError on any failure.
-    from google.auth import jwt
-
     try:
       claims = jwt.decode(token, certs=keys, audience=self.audience,
                           clock_skew_in_seconds=CLOCK_SKEW_SECONDS)
@@ -151,7 +183,7 @@ def verifier_from_env() -> IapVerifier:
     log.info("IAP identity check on for /ws")
   else:
     log.warning("IAP_AUDIENCE not set: /ws callers are anonymous (local development only)")
-  return IapVerifier(audience)
+  return IapVerifier(audience, keys_url=os.getenv("IAP_KEYS_URL", IAP_KEYS_URL).strip() or IAP_KEYS_URL)
 
 
 async def identify(verifier: IapVerifier, headers, anonymous_id: str) -> Caller:

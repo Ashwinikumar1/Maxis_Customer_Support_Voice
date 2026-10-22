@@ -106,8 +106,33 @@ def _redact_value(value):
 
 # ----------------------------------------------------------------------------- Sensitive Data Protection
 
+# Sensitive Data Protection limits a content request to 0.5 MB and 50,000 table values
+# (Sensitive Data Protection docs: "Usage limits"); stay well under both by batching turns.
+_DLP_BATCH_BYTES = 400_000
+_DLP_BATCH_ROWS = 5_000
+
+
+def _dlp_batches(texts: list[str]) -> list[list[str]]:
+  batches, current, size = [], [], 0
+  for t in texts:
+    n = len(t.encode()) + 64  # a little room for the JSON around each value
+    if current and (size + n > _DLP_BATCH_BYTES or len(current) >= _DLP_BATCH_ROWS):
+      batches.append(current)
+      current, size = [], 0
+    current.append(t)
+    size += n
+  if current:
+    batches.append(current)
+  return batches
+
+
 def _dlp_deidentify(texts: list[str]) -> list[str]:
-  """Runs the transcript through the voice-agent inspect and de-identify templates (one call)."""
+  """Runs the transcript through the voice-agent inspect and de-identify templates.
+
+  REST `projects.locations.content.deidentify` with the turns as a one-column table. Field
+  names are the REST API's lowerCamelCase (`stringValue`, Sensitive Data Protection reference:
+  Value). Turns are sent in batches under the request limits; the output keeps their order.
+  """
   import google.auth
   from google.auth.transport.requests import AuthorizedSession
 
@@ -115,13 +140,19 @@ def _dlp_deidentify(texts: list[str]) -> list[str]:
   deidentify = os.environ["DLP_DEIDENTIFY_TEMPLATE"]
   parent = inspect.split("/inspectTemplates/")[0]
   creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-  table = {"headers": [{"name": "text"}], "rows": [{"values": [{"string_value": t}]} for t in texts]}
-  resp = AuthorizedSession(creds).post(
-      f"https://dlp.googleapis.com/v2/{parent}/content:deidentify", timeout=20,
-      json={"inspectTemplateName": inspect, "deidentifyTemplateName": deidentify, "item": {"table": table}})
-  resp.raise_for_status()
-  rows = resp.json()["item"]["table"]["rows"]
-  return [r["values"][0].get("stringValue", "") for r in rows]
+  session = AuthorizedSession(creds)
+  out: list[str] = []
+  for batch in _dlp_batches(texts):
+    table = {"headers": [{"name": "text"}], "rows": [{"values": [{"stringValue": t}]} for t in batch]}
+    resp = session.post(
+        f"https://dlp.googleapis.com/v2/{parent}/content:deidentify", timeout=20,
+        json={"inspectTemplateName": inspect, "deidentifyTemplateName": deidentify, "item": {"table": table}})
+    resp.raise_for_status()
+    rows = resp.json()["item"]["table"]["rows"]
+    if len(rows) != len(batch):  # never store a transcript whose turns no longer line up
+      raise RuntimeError("de-identify returned a different number of rows")
+    out.extend(r["values"][0].get("stringValue", "") for r in rows)
+  return out
 
 
 class RedactingTranscriptLogger(TranscriptLogger):

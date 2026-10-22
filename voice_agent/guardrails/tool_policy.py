@@ -105,6 +105,14 @@ def set_verification_level(state, level: int, source: str) -> None:
 
 
 def flag_injection(state, source: str, category: str = "") -> None:
+  """Marks this call as injection-suspected: write tools are refused for the rest of it.
+
+  In live mode ADK runs the screening callbacks on a temporary event that is never appended
+  to the session, so this flag lives in the in-memory session state of the current call only
+  (tools later in the same call do see it; that is all AP-09 needs, because every new
+  connection is a new session). The durable record is the `injection_flag` security event
+  below, which goes to Cloud Logging and the SIEM.
+  """
   if not state.get(K_INJECTION):
     state[K_INJECTION] = True
   security_event("injection_flag", source=source, category=category or None, severity="WARNING")
@@ -149,7 +157,10 @@ def _env_writes_enabled() -> bool:
 
 
 def _refuse(reason: str, next_step: str = "offer_agent") -> dict:
-  return {"status": "refused", "reason": reason, "next_step": next_step,
+  # "retryable": False follows Google's tool-response guidance for gemini-3.8-live: without it
+  # the model may retry a refused call with slightly different arguments (Vertex AI >
+  # Gemini 3.8 Live guide, "Return structured fields in every tool response").
+  return {"status": "refused", "retryable": False, "reason": reason, "next_step": next_step,
           "message": "This can't be done on this call. Offer to connect the caller to a person."}
 
 

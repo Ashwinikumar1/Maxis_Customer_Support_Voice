@@ -137,3 +137,27 @@ def test_require_iap_without_audience_stops_start_up(monkeypatch):
 def test_hash_id_matches_event_hash(monkeypatch):
   monkeypatch.setenv("SECURITY_EVENT_HMAC_KEY", "k")
   assert events.build_event("x", session="session_1")["session"] == events.hash_id("session_1")
+
+
+def test_other_algorithm_or_missing_kid_refused():
+  import base64
+  import json as _json
+
+  def b64(d):
+    return base64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
+
+  body = b64({"aud": AUD, "iss": IAP_ISSUER, "sub": "x"})
+  for header in ({"alg": "HS256", "kid": "k1"}, {"alg": "none", "kid": "k1"}, {"alg": "ES256"}):
+    with pytest.raises(IdentityError) as exc:
+      _verify(f"{b64(header)}.{body}.c2ln")
+    assert exc.value.reason == "iap_wrong_algorithm_or_kid"
+
+
+def test_keys_url_from_env(monkeypatch):
+  monkeypatch.setenv("IAP_AUDIENCE", AUD)
+  monkeypatch.setenv("IAP_KEYS_URL", "gs://voice-agent-iap-keys/public_key.json")
+  assert verifier_from_env().keys_url == "gs://voice-agent-iap-keys/public_key.json"
+  monkeypatch.setenv("IAP_KEYS_URL", "http://insecure.example/keys")
+  with pytest.raises(IdentityError) as exc:  # non-https download refused, so: no keys, fail closed
+    _verify(_token(), IapVerifier(AUD, keys_url="http://insecure.example/keys"))
+  assert exc.value.reason == "iap_keys_unavailable"

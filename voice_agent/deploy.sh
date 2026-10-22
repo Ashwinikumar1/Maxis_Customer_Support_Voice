@@ -13,14 +13,14 @@ set -a; source .env; set +a
 # This script is for a developer's own project. It builds from local source,
 # grants roles at project level and, by default, deploys a public service.
 # Test and production must instead go through the pipeline
-# (security/ci/cloudbuild-image.yaml): it scans the image, signs it, deploys by
+# (security/ci/cloudbuild-build.yaml, then cloudbuild-deploy.yaml): they scan the image, sign it, deploy by
 # digest with Binary Authorization, and IAM comes from security/terraform.
 # Set DEPLOY_ENV in .env; anything other than "dev" stops here, so the script
 # can't be pointed at a shared environment by mistake.
 # -----------------------------------------------------------------------------
 if [[ "${DEPLOY_ENV:-dev}" != "dev" ]]; then
   echo "deploy.sh is for personal dev projects only (DEPLOY_ENV=${DEPLOY_ENV})."
-  echo "Deploy test and prod through security/ci/cloudbuild-image.yaml."
+  echo "Deploy test and prod through security/ci/cloudbuild-build.yaml and cloudbuild-deploy.yaml."
   exit 1
 fi
 
@@ -79,7 +79,7 @@ ENV_VARS=(
   "FAQ_SEARCH_ENGINE_ID=$FAQ_SEARCH_ENGINE_ID"
   "GCS_BUCKET=${GCS_BUCKET:-}"
   "GCS_LOG_PREFIX=$GCS_LOG_PREFIX"
-  "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=$ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
+  "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=${ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS:-false}"  # ADK defaults this ON when unset or empty
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
   "ALLOWED_ORIGINS=$SERVICE_URL"
@@ -95,6 +95,7 @@ ENV_VARS=(
   "SILENCE_RMS_THRESHOLD=${SILENCE_RMS_THRESHOLD:-500}"
   "IAP_AUDIENCE=${IAP_AUDIENCE:-}"
   "REQUIRE_IAP=${REQUIRE_IAP:-false}"
+  "IAP_KEYS_URL=${IAP_KEYS_URL:-}"
   "REQUIRE_PERSISTENT_SESSIONS=${REQUIRE_PERSISTENT_SESSIONS:-false}"
 )
 # Secrets come from Secret Manager, never plain env vars: the HMAC key for security events and,

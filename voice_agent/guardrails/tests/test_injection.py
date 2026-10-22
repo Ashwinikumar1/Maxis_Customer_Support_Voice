@@ -60,3 +60,40 @@ def test_bad_model_armor_mode_rejected(monkeypatch):
   monkeypatch.setenv("MODEL_ARMOR_MODE", "off")
   with pytest.raises(ValueError):
     build_model_armor_plugin()
+
+
+def test_live_output_screened_per_sentence_and_flagged_once(monkeypatch):
+  from guardrails import injection
+  """ADK calls after_model on every live transcription chunk; screen at sentence ends only."""
+  import asyncio
+  from types import SimpleNamespace
+
+  from google.adk.integrations.model_armor import ModelArmorPlugin
+  from google.genai import types
+
+  monkeypatch.setenv("MODEL_ARMOR_PROMPT_TEMPLATE", "projects/p/locations/asia-southeast1/templates/in")
+  monkeypatch.setenv("MODEL_ARMOR_RESPONSE_TEMPLATE", "projects/p/locations/asia-southeast1/templates/out")
+  screened = []
+
+  async def fake_screen(self, *, callback_context, llm_response):
+    screened.append(llm_response.output_transcription.text)
+    return "BLOCKED"  # pretend every screened text matches
+
+  monkeypatch.setattr(ModelArmorPlugin, "after_model_callback", fake_screen)
+  plugin = injection.build_model_armor_plugin()
+  ctx = SimpleNamespace(invocation_id="inv1", state={})
+  events = []
+  monkeypatch.setattr(injection, "flag_injection", lambda state, **kw: events.append(kw))
+
+  async def chunk(text):
+    resp = SimpleNamespace(output_transcription=types.Transcription(text=text, finished=False))
+    return await plugin.after_model_callback(callback_context=ctx, llm_response=resp)
+
+  async def run():
+    for text in ["Sure", "Sure, roaming", "Sure, roaming passes start at RM10.", "Sure, roaming passes start at RM10. Anything"]:
+      await chunk(text)
+    await chunk("Next turn.")  # shorter text: a new turn
+
+  asyncio.run(run())
+  assert screened == ["Sure, roaming passes start at RM10.", "Next turn."]
+  assert len(events) == 2  # once per turn, not once per chunk

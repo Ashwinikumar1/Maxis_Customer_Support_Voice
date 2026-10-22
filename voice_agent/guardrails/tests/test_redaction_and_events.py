@@ -81,3 +81,44 @@ def test_events_hash_identifiers_and_drop_unknown_fields(monkeypatch):
   assert e["session"] != "session_123" and e["line"] != "0123456789"
   assert "query" not in e and e["tool"] == "t"
   assert events.build_event("x", session="session_123")["session"] == e["session"]  # stable
+
+
+def test_dlp_request_uses_rest_field_names_and_batches(monkeypatch):
+  """REST body uses lowerCamelCase (stringValue) and stays under the 0.5 MB request limit."""
+  import google.auth
+  from google.auth.transport import requests as gat
+
+  from guardrails import redaction as r
+
+  monkeypatch.setenv("DLP_INSPECT_TEMPLATE", "projects/p/locations/asia-southeast1/inspectTemplates/i")
+  monkeypatch.setenv("DLP_DEIDENTIFY_TEMPLATE", "projects/p/locations/asia-southeast1/deidentifyTemplates/d")
+  monkeypatch.setattr(google.auth, "default", lambda scopes=None: (object(), "p"))
+  bodies = []
+
+  class FakeResp:
+    def __init__(self, body):
+      self.body = body
+
+    def raise_for_status(self):
+      pass
+
+    def json(self):
+      rows = self.body["item"]["table"]["rows"]
+      return {"item": {"table": {"rows": [{"values": [{"stringValue": "[X]"}]} for _ in rows]}}}
+
+  class FakeSession:
+    def __init__(self, creds):
+      pass
+
+    def post(self, url, timeout, json):
+      assert url == "https://dlp.googleapis.com/v2/projects/p/locations/asia-southeast1/content:deidentify"
+      bodies.append(json)
+      return FakeResp(json)
+
+  monkeypatch.setattr(gat, "AuthorizedSession", FakeSession)
+  texts = ["x" * 100_000 for _ in range(10)]  # ~1 MB in total
+  out = r._dlp_deidentify(texts)
+  assert out == ["[X]"] * 10
+  assert len(bodies) >= 3
+  assert all("stringValue" in b["item"]["table"]["rows"][0]["values"][0] for b in bodies)
+  assert all(len(__import__("json").dumps(b)) < 500_000 for b in bodies)

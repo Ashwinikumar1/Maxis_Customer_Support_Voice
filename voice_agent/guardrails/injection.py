@@ -101,7 +101,27 @@ def build_model_armor_plugin():
   # Configured but not installed is a deployment error: fail at startup, not silently.
   from google.adk.integrations.model_armor import ModelArmorConfig, ModelArmorPlugin
 
+  screening = os.getenv("MODEL_ARMOR_OUTPUT_SCREENING", "sentence").lower()
+  if screening not in ("sentence", "chunk"):
+    raise ValueError("MODEL_ARMOR_OUTPUT_SCREENING must be sentence or chunk")
+
   class FlaggingModelArmorPlugin(ModelArmorPlugin):
+    """ADK's Model Armor plugin, plus flagging and live-mode output throttling.
+
+    In live mode ADK calls after_model_callback on *every* output-transcription chunk, each
+    time with the whole turn's text so far (google/adk/live/_live_llm_flow.py, "Live callback
+    site 2 of 3"). Screening every chunk means one Model Armor call per chunk and, in inspect
+    mode, one warning event per chunk. With MODEL_ARMOR_OUTPUT_SCREENING=sentence (default)
+    the text is screened when a sentence ends or 200 more characters have arrived, and the
+    flag is raised at most once per turn. `chunk` screens every chunk (earliest block, highest
+    cost). Either way the caller may already have heard the audio: Model Armor screens the
+    transcription, not the audio stream (ADK docs: Model Armor integration).
+    """
+
+    def __init__(self, *args, **kwargs):
+      super().__init__(*args, **kwargs)
+      # invocation_id -> (length of text last screened, already flagged this turn)
+      self._turns: dict[str, tuple[int, bool]] = {}
 
     async def before_model_callback(self, *, callback_context, llm_request):
       blocked = await super().before_model_callback(callback_context=callback_context, llm_request=llm_request)
@@ -111,9 +131,22 @@ def build_model_armor_plugin():
       return None
 
     async def after_model_callback(self, *, callback_context, llm_response):
+      live_text = getattr(getattr(llm_response, "output_transcription", None), "text", None)
+      key = callback_context.invocation_id
+      last_len, flagged = self._turns.get(key, (0, False))
+      if live_text is not None:
+        if len(live_text) < last_len:  # the text restarted: a new turn
+          last_len, flagged = 0, False
+        sentence_end = live_text.rstrip().endswith((".", "?", "!"))
+        if screening == "sentence" and not sentence_end and len(live_text) - last_len < 200:
+          return None  # wait for the end of the sentence; the next chunk carries this text too
+        last_len = len(live_text)
+      self._turns[key] = (last_len, flagged)
       blocked = await super().after_model_callback(callback_context=callback_context, llm_response=llm_response)
       if blocked is not None:
-        flag_injection(callback_context.state, source="model_armor", category="output_match")
+        if not flagged:
+          flag_injection(callback_context.state, source="model_armor", category="output_match")
+          self._turns[key] = (last_len, True)
         return blocked if mode == "block" else None
       return None
 

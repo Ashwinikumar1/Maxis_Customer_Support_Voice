@@ -10,7 +10,9 @@ from datetime import datetime
 
 from google.adk.agents import Agent
 
-from guardrails import generate_content_config
+from google.adk.apps import App
+
+from guardrails import build_plugins, generate_content_config
 
 from .faq_search_tool import search_knowledge_base
 from .prompts import orchestrator_instruction
@@ -35,3 +37,10 @@ def create_root_agent(ctx: dict | None = None) -> Agent:
 
 
 root_agent = create_root_agent()
+
+# `adk eval` and `adk web` use a module-level `app` when there is one, and only fall back to the
+# bare `root_agent` otherwise (google/adk/cli/cli_eval.py, get_app_or_root_agent). Exposing the
+# App with the guardrail plugins means the security evaluation tests the agent as it really runs,
+# tool policy, injection flag and Model Armor included. server.py still builds its own App per
+# call (with that call's date in the prompt).
+app = App(name="voice_assistant", root_agent=root_agent, plugins=build_plugins())

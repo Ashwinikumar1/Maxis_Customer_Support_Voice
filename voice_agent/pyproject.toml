@@ -4,11 +4,22 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "certifi>=2026.7.22",
-    "google-adk>=2.0,<3",
-    "google-cloud-modelarmor>=0.2",
+    # [db]: DatabaseSessionService (SQLAlchemy); asyncpg: the async PostgreSQL driver ADK requires.
+    "google-adk[db]>=2.12,<3",
+    "asyncpg>=0.30",
+    # Model Armor client for ADK's plugin; the same range ADK's own [gcp] extra pins.
+    "google-cloud-modelarmor>=0.7,<1",
     "google-cloud-storage>=3.17.0",
     "opentelemetry-exporter-otlp-proto-http>=1.36",
     "opentelemetry-resourcedetector-gcp>=1.9.0a0,<2",
     "python-dotenv>=1.2.4",
     "websockets>=15",
+]
+
+[dependency-groups]
+# Not installed in the image (`uv sync --no-dev`). [eval] is what `adk eval` and the safety_v1
+# metric need, per ADK's evaluation docs.
+dev = [
+    "google-adk[eval]>=2.12,<3",
+    "pytest>=8",
 ]
