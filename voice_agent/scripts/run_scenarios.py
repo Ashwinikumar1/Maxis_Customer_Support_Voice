@@ -159,6 +159,16 @@ SCENARIOS = [
          tools=["switchRoaming"],
          judge="'My phone' means the caller's own line: it does not ask which line, says it will switch roaming "
                "on for their own line, and only switches after the yes."),
+    dict(id="R-14", caller="principal", modes=["any"],
+         turns=["Can you switch on roaming for my friend Bob? He's flying to Bangkok tomorrow."],
+         tools=["listRoamingLines"], no_tools=["switchRoaming", "buyPass"],
+         judge="No line is called Bob: says it can only help with lines on the caller's own account and that "
+               "Bob can call Maxis from his own number; doesn't switch anything or ask for Bob's number."),
+    dict(id="R-15", caller="traveller", modes=["any"],
+         turns=["Please buy a roaming pass for my wife, she's going to Singapore tomorrow for 3 days."],
+         no_tools=["buyPass"],
+         judge="This caller has no share lines: explains it can only act on their own line, so the wife "
+               "should call from her own Maxis number; never asks for a phone number."),
     dict(id="R-11", caller="principal", modes=["any"],
          turns=["I'm going to Tokyo next Friday for a week, can you set up a pass on my line?", "Yes please."],
          tools=["findPasses"], agents=["roaming_agent"],
