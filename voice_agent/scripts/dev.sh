@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # One command for the usual local tasks. Run from anywhere:
 #
+#   voice_agent/scripts/dev.sh             # EVERYTHING, once: setup -> offline tests -> start the server
+#                                          #   (stops at the first failure; add --rebuild to rewrite .env
+#                                          #   with every comment, --scenarios to also run the model tests)
+#
+# Or one step at a time:
 #   voice_agent/scripts/dev.sh setup       # check tools + Google sign-in, update .env, install deps
 #                                          #   (setup --rebuild: .env in the template layout, all comments)
 #   voice_agent/scripts/dev.sh test        # all tests that need no cloud access (~1 min)
@@ -57,7 +62,27 @@ run_tests() {
   step "All tests passed"
 }
 
-case "${1:-help}" in
+start() {
+  local rebuild="" scenarios=""
+  for arg in "$@"; do
+    case "$arg" in
+      --rebuild) rebuild="--rebuild" ;;
+      --scenarios) scenarios=1 ;;
+      *) die "Unknown option '$arg'. Use --rebuild and/or --scenarios" ;;
+    esac
+  done
+  setup $rebuild
+  run_tests
+  if [[ -n "$scenarios" ]]; then
+    step "Scenarios on the real model"
+    uv run python scripts/run_scenarios.py --judge || echo "Some scenarios failed: see above (the server starts anyway)."
+  fi
+  step "Starting the server: open http://127.0.0.1:8080 (Ctrl+C to stop)"
+  uv run python -m observability
+}
+
+case "${1:---start}" in
+  --start|--rebuild|--scenarios) [[ "${1:-}" == "--start" ]] && shift; start "$@" ;;
   setup)     shift; setup "$@" ;;
   test)      run_tests ;;
   scenarios) shift; uv run python scripts/run_scenarios.py "$@" ;;
@@ -66,6 +91,6 @@ case "${1:-help}" in
   deploy)    ./deploy.sh ;;
   validate)  shift; uv run python scripts/validate_observability.py "$@" ;;
   all)       shift; setup; run_tests; uv run python scripts/run_scenarios.py "$@" ;;
-  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "Unknown command '$1'. Try: setup, test, scenarios, run, mock, deploy, validate, all" ;;
 esac

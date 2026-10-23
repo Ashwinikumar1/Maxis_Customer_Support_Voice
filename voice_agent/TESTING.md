@@ -15,13 +15,18 @@ Three levels, fastest first:
 
 ---
 
-## 0. Setup (once): one command
+## 0. Quick start: one command
 
 ```bash
-voice_agent/scripts/dev.sh setup
+voice_agent/scripts/dev.sh             # setup -> all offline tests -> starts the server
+voice_agent/scripts/dev.sh --rebuild   # same, and rewrites .env with every setting's explanation
+voice_agent/scripts/dev.sh --scenarios # same, and also runs the model scenarios before the server
 ```
 
-This does everything:
+It stops at the first failure. When it ends with "Starting the server", open http://127.0.0.1:8080.
+After the first time, `scripts/dev.sh run` is all you need to start the server again.
+
+The setup part (also on its own as `scripts/dev.sh setup`) does this:
 1. Checks `uv` (and `gcloud`).
 2. Creates or updates `.env` with `scripts/setup_env.py`. It adds every setting from `.env.example` that your
    `.env` is missing, keeps your values exactly as they are, and backs the old file up as `.env.bak.<time>`.
