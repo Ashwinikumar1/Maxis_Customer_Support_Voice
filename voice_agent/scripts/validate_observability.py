@@ -187,13 +187,24 @@ async def make_test_call(base_url):
   report("PASS", "Test call connected")
   try:
     async def reader():
+      # gemini-3.8-live sends turn_complete twice when it uses a tool: first after
+      # the filler ("let me check", state IN_PROGRESS), then after the spoken
+      # answer (state IDLE). Only IDLE means the answer is finished, and only
+      # audio after the tool result is the answer itself.
       async for raw in ws:
-        kind = json.loads(raw).get("type")
+        message = json.loads(raw)
+        kind = message.get("type")
         got["types"].add(kind)
-        if kind == "audio" and got.get("asked"):
+        if not got.get("asked"):
+          continue
+        if kind == "tool_result":
+          got["tool_used"] = True
+        elif kind == "audio" and (got.get("tool_used") or not got.get("tool_pending")):
           got["audio_after_question"] = True
-        elif kind == "turn_complete" and got["audio_after_question"]:
-          got["answer_done"] = True
+        elif kind == "tool_call":
+          got["tool_pending"], got["audio_after_question"] = True, False  # filler audio isn't the answer
+        elif kind == "turn_complete" and message.get("state", "IDLE") == "IDLE" and got.get("audio_after_question"):
+          got["answer_done"] = True  # (an IDLE before any answer audio is the greeting ending)
     task = asyncio.create_task(reader())
     await asyncio.sleep(6.5)                                          # no init -> init-timeout log
     await ws.send("this is not json")                                 # -> invalid_message
@@ -201,13 +212,10 @@ async def make_test_call(base_url):
     await asyncio.sleep(3)                                            # let the greeting start
     got["asked"] = True
     await ws.send(json.dumps({"type": "text", "data": QUESTION}))
-    deadline = time.monotonic() + 30
-    while not got["audio_after_question"] and time.monotonic() < deadline and not task.done():
-      await asyncio.sleep(0.5)
-    # Wait for the answer to FINISH (turn_complete) before hanging up: Gemini
-    # sends its token report at the end of a turn, so hanging up mid-answer
+    # Wait for the answer to FINISH (turn_complete, state IDLE) before hanging up:
+    # Gemini sends its token report at the end of a turn, so hanging up mid-answer
     # leaves the call with tokens=n/a (seen on the first real run).
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + 45                                  # FAQ search + spoken answer
     while not got.get("answer_done") and time.monotonic() < deadline and not task.done():
       await asyncio.sleep(0.5)
     await asyncio.sleep(2)                                            # let the usage report arrive
@@ -216,9 +224,9 @@ async def make_test_call(base_url):
     task.cancel()
   finally:
     await ws.close()
-  check(got["audio_after_question"], "Agent answered the typed question with audio",
-        detail_bad=f"no answer audio within 30 s (received: {sorted(t for t in got['types'] if t)})")
-  check(bool(got.get("answer_done")), "Answer finished before hanging up (turn_complete)", bad="WARN",
+  check(got["audio_after_question"], "Agent spoke its answer" + (" (audio after the FAQ result)" if got.get("tool_used") else ""),
+        detail_bad=f"no answer audio within 45 s (received: {sorted(t for t in got['types'] if t)})")
+  check(bool(got.get("answer_done")), "Answer finished before hanging up (turn_complete, IDLE)", bad="WARN",
         detail_bad="no turn_complete within 45 s - token checks below may show n/a")
   return True
 
