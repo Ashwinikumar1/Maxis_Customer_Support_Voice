@@ -27,6 +27,10 @@ MYT = ZoneInfo("Asia/Kuala_Lumpur")
 DUPLICATE_WINDOW = timedelta(minutes=10)
 PURCHASE_POLL_LIMIT_S = 20        # production polls every 2 s for up to 20 s
 REPORTED_SWITCH_MINUTES = 5       # what production tells the caller
+# How long an explicit switchRoaming stays "setting_up" in the mock: by default as long as the caller is
+# told (5 minutes), like production, where the gateway reports setting_up until Maxis shows the change.
+# (Roaming switched on by a purchase uses each test line's own switch_seconds, so purchases complete.)
+SWITCH_SECONDS = int(os.getenv("MOCK_SWITCH_SECONDS", str(REPORTED_SWITCH_MINUTES * 60)))
 WHATSAPP_TEMPLATES = {"manage_passes", "wrong_pass", "insurance"}  # pay_bill isn't set up
 
 
@@ -470,7 +474,7 @@ class MockGateway:
     if not confirmed:
       return {**result, "next_step": "confirm_switch"}
 
-    line.update(roaming="setting_up", roaming_ready_at=now + timedelta(seconds=line["switch_seconds"]),
+    line.update(roaming="setting_up", roaming_ready_at=now + timedelta(seconds=SWITCH_SECONDS),
                 _target=turn)
     done = {**result, "ready_in_minutes": REPORTED_SWITCH_MINUTES, "next_step": "switch_requested"}
     self._switches[key] = (now, deepcopy(done))

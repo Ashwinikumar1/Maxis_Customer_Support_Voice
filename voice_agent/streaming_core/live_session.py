@@ -402,6 +402,15 @@ class LiveVoiceSession:
       self.turn.start(trigger="user_text")  # typed turn: the latency clock starts now
       self.queue.send_content(types.Content(role="user", parts=[types.Part(text=text)]))
 
+  # Sent once when the call connects, so the agent greets first, as the production bot does (Gemini
+  # Live otherwise waits for the caller to speak). It is a cue, not something the caller said, so it
+  # is not written to the transcript and the agent's instructions say what to reply.
+  CALL_CONNECTED_CUE = "[The call has just connected. The caller hasn't said anything yet.]"
+
+  def greet_first(self):
+    """Makes the agent speak its greeting at once, before the caller says anything."""
+    self.queue.send_content(types.Content(role="user", parts=[types.Part(text=self.CALL_CONNECTED_CUE)]))
+
   def close(self):
     """Ends the live stream; run_live() finishes and the Gemini connection closes."""
     self.queue.close()

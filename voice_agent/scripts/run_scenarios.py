@@ -147,6 +147,18 @@ SCENARIOS = [
     dict(id="R-10", caller="principal", modes=["specialist"], turns=["How much is roaming in Japan?"],
          tools=["findPasses"], no_tools=["buyPass"],
          judge="Mentions a couple of options with prices in words; doesn't push a purchase."),
+    dict(id="R-12", caller="principal", modes=["any"],
+         turns=["I need to enable roaming on the share line ending in two one.", "Yes, please.",
+                "My friend Adam also needs it. Can you enable it on his?"],
+         tools=["listRoamingLines", "switchRoaming"], agents=["roaming_agent"],
+         judge="Calls the share line by its nickname Adam's phone (not only its label); switches only after a "
+               "yes; when asked about Adam, says it's the same line it just switched on and the change is still "
+               "being set up (about five minutes) - never that roaming is already on."),
+    dict(id="R-13", caller="principal", modes=["any"],
+         turns=["Please turn on roaming on my phone.", "Yes."],
+         tools=["switchRoaming"],
+         judge="'My phone' means the caller's own line: it does not ask which line, says it will switch roaming "
+               "on for their own line, and only switches after the yes."),
     dict(id="R-11", caller="principal", modes=["any"],
          turns=["I'm going to Tokyo next Friday for a week, can you set up a pass on my line?", "Yes please."],
          tools=["findPasses"], agents=["roaming_agent"],

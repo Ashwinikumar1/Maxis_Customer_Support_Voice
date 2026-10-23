@@ -210,6 +210,8 @@ def test_switch_off_with_passes_warns_then_confirms(run, clock):
   assert (done["next_step"], done["ready_in_minutes"]) == ("switch_requested", 5)
   assert step(run("switch_roaming", caller_id=TRAVELLER, turn="on")) == "still_setting_up"
   clock.advance(minutes=1)
+  assert step(run("switch_roaming", caller_id=TRAVELLER, turn="off")) == "still_setting_up"  # as told: ~5 min
+  clock.advance(minutes=5)
   assert step(run("switch_roaming", caller_id=TRAVELLER, turn="off")) == "already_off"
 
 

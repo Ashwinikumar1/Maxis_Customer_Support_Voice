@@ -143,6 +143,8 @@ MAX_B64_LEN = 512 * 1024    # reject oversized audio frames (DoS protection)
 END_GRACE_S = 1.5           # after end_session: let the last audio reach the client
 END_MAX_WAIT_S = 15.0       # ... but never keep the call open longer than this
 MAX_SESSION_SECONDS = int(os.getenv("MAX_SESSION_SECONDS", "1800"))  # end calls after 30 min (AP-11)
+# The agent greets as soon as the call connects (true) or waits for the caller to speak first (false).
+GREET_ON_CONNECT = os.getenv("GREET_ON_CONNECT", "true").lower() == "true"
 
 # Test callers for the browser client: the picker's choice becomes the session's
 # caller_id (Genesys will pass the real calling number instead). Only with the
@@ -430,6 +432,8 @@ async def _handle_client(websocket):
                              run_config=default_run_config(VOICE_NAME), transcript=transcript,
                              trace_session_id=session_ref)
   logger.info("Session %s started (%s, caller %s)", session_ref, ctx["timezone"], caller_key or "withheld")
+  if GREET_ON_CONNECT:
+    session.greet_first()  # the agent greets as soon as the call connects, like the production bot
 
   # Silence limit (guardrails/call_limits.py): ends the call after
   # SILENCE_TIMEOUT_SECONDS (default 120) in which neither side said anything.
