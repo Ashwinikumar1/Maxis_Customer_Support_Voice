@@ -37,7 +37,7 @@ The setup part (also on its own as `scripts/dev.sh setup`) does this:
 
 | Command | Does |
 |---|---|
-| `scripts/dev.sh test` | All tests that need no cloud access: pytest, observability, security checks (~1 min) |
+| `scripts/dev.sh test` | All tests that need no cloud access: pytest, observability, security checks (~1 min). Terraform validation is skipped: it downloads providers (Google, Genesys Cloud) that corporate networks often block; `dev.sh test --terraform` includes it |
 | `scripts/dev.sh scenarios [--judge -v ...]` | Section 2 (real model, typed turns) |
 | `scripts/dev.sh run` | Section 3: the server as Cloud Run starts it, http://127.0.0.1:8080 |
 | `scripts/dev.sh mock` | Section 5: standalone mock gateway on :8090 |
