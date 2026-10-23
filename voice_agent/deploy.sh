@@ -101,10 +101,19 @@ echo "== Deploy $SERVICE -> $SERVICE_URL"
 # WebSocket voice calls need: long request timeout (max 60 min), session affinity,
 # and CPU kept allocated so audio streaming, the transcript upload and the trace
 # export keep running between requests (--no-cpu-throttling).
+# Public access (callers have no Google sign-in): --no-invoker-iam-check makes
+# Cloud Run skip its IAM check. It is Google's recommended way when the
+# organisation enforces domain-restricted sharing (iam.allowedPolicyMemberDomains),
+# which silently blocks the allUsers grant behind --allow-unauthenticated:
+# https://docs.cloud.google.com/run/docs/authenticating/public
+# Seen on 23 Oct 2026: the service's IAM policy was empty and every request got
+# Cloud Run's own 403. It fails only if the org enforces
+# constraints/run.managed.requireInvokerIam (not enforced by default).
+# /ws still checks the Origin header (server.py process_request).
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --service-account "$SA" \
-  --allow-unauthenticated \
+  --allow-unauthenticated --no-invoker-iam-check \
   --timeout 3600 --session-affinity --no-cpu-throttling \
   --cpu 2 --memory 1Gi --concurrency 20 \
   --min-instances "$CLOUD_RUN_MIN_INSTANCES" --max-instances "$CLOUD_RUN_MAX_INSTANCES" \
