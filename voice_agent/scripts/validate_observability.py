@@ -312,7 +312,9 @@ def check_trace(gcp, trace_id, sid, engine_id, version):
   check(bool(turns), "model_turn spans (one per agent reply)", f"{len(turns)} turns", "none in the trace")
   if turns:
     typed = [t for t in turns if t.get("voice.turn_trigger") == "user_text"]
-    check(bool(typed), "model_turn: typed question has trigger user_text", f"{len(turns)} turns")
+    by_trigger = ", ".join(f"{k}={sum(t.get('voice.turn_trigger') == k for t in turns)}"
+                           for k in sorted({t.get("voice.turn_trigger") for t in turns} - {None}))
+    check(bool(typed), "model_turn: typed question has trigger user_text", by_trigger)
     check(any("voice.time_to_first_audio_ms" in t for t in typed), "model_turn: time to first audio on the answered turn",
           detail_bad="no voice.time_to_first_audio_ms on any user_text turn")
     check(not any(t.get("voice.time_to_first_audio_ms") for t in turns if t.get("voice.turn_trigger") == "model"),

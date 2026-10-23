@@ -64,6 +64,41 @@ class TimeToFirstAudioTests(unittest.TestCase):  # 5
     self.assertTrue({"user_speech", "user_text"} <= triggers)
     self.assertNotIn(None, triggers, "every recorded sample carries its trigger")
 
+  def test_wait_carries_over_when_the_model_searches_first_without_a_filler(self):
+    # Seen in Cloud Trace: question -> tool call (no audio) -> turn_complete
+    # IN_PROGRESS -> next turn speaks the answer. The wait must still be recorded.
+    before = sum(p.count for p in _ttfa_points())
+    turn = _TurnTracker("s1")
+    turn.start("maxis_agent", trigger="user_text")
+    time.sleep(0.03)                       # model calls the FAQ tool, says nothing
+    turn.end("in_progress")
+    time.sleep(0.03)                       # tool runs
+    turn.first_audio("maxis_agent")        # the answer: opens the next turn
+    turn.end("idle")
+    span = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(span.attributes["voice.turn_trigger"], "user_text")
+    self.assertTrue(span.attributes["voice.wait_carried_over"])
+    self.assertGreaterEqual(span.attributes["voice.time_to_first_audio_ms"], 60, "measured from the question")
+    self.assertEqual(sum(p.count for p in _ttfa_points()), before + 1)
+
+  def test_no_carry_over_after_audio_or_interruption(self):
+    for first_end in ("idle", "interrupted"):
+      turn = _TurnTracker("s1")
+      turn.start("maxis_agent", trigger="user_speech")
+      turn.end(first_end)
+      turn.first_audio("maxis_agent")      # model speaks on its own
+      turn.end("idle")
+      span = EXPORTER.get_finished_spans()[-1]
+      self.assertEqual(span.attributes["voice.turn_trigger"], "model", first_end)
+      self.assertNotIn("voice.time_to_first_audio_ms", span.attributes)
+    turn = _TurnTracker("s1")              # filler audio WAS heard: that turn holds the wait
+    turn.start("maxis_agent", trigger="user_text")
+    turn.first_audio("maxis_agent")
+    turn.end("in_progress")
+    turn.first_audio("maxis_agent")
+    turn.end("idle")
+    self.assertEqual(EXPORTER.get_finished_spans()[-1].attributes["voice.turn_trigger"], "model")
+
   def test_send_text_starts_a_user_text_turn(self):
     session = LiveVoiceSession(runner=None, user_id="u", session_id="s", run_config=None,
                                transcript=TranscriptLogger("s"))

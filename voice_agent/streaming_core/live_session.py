@@ -221,6 +221,21 @@ class _TurnTracker:
     self.tokens = tokens
     self.tokens_at_start = {}
     self.agent = ""  # gen_ai.agent.name of the open turn, once known
+    # [#5b] When the caller's wait began (usually = start_ns; see _carried_wait).
+    self.wait_start_ns = 0
+    # [#5b] A caller's wait that is still running when its turn ended silently:
+    # (wait_start_ns, trigger), or None.
+    #   THE GAP (found in Cloud Trace on 23 Oct 2026): for "Can I schedule my
+    #   pass before I fly?" the model went straight to the FAQ search without a
+    #   filler word. gemini-3.8-live then ends that turn (turn_complete,
+    #   IN_PROGRESS) with no audio, and the spoken answer arrives in the NEXT
+    #   turn, which starts at the model's own output - a `model` turn. So the
+    #   caller's real wait (question -> first sound) was recorded nowhere,
+    #   exactly for the questions that need a search and wait longest.
+    #   THE FIX: a user-triggered turn that ends IN_PROGRESS without audio hands
+    #   its stopwatch to the next turn. That turn keeps the user's trigger and
+    #   records the wait from the moment the caller finished asking.
+    self._carried_wait = None
 
   def start(self, agent: str = "", trigger: str = "model"):
     # [#5] `trigger` is fixed by whoever opens the turn FIRST. If the agent has
@@ -229,11 +244,19 @@ class _TurnTracker:
     # unknown, so it is left out of the metric rather than recorded wrongly.
     if self.span is None:
       self.start_ns = time.time_ns()
+      self.wait_start_ns = self.start_ns
       self.got_audio = False
+      carried = None
+      if self._carried_wait and trigger == "model":  # [#5b] the caller is still waiting
+        carried = self._carried_wait
+        self.wait_start_ns, trigger = carried
+      self._carried_wait = None  # a new question (or the hand-over above) replaces it
       self.trigger = trigger
       self.tokens_at_start = self.tokens.totals() if self.tokens else {}  # [#12] baseline for this turn
-      self.span = _tracer.start_span("model_turn", start_time=self.start_ns, attributes={
-          "session.id": self.session_id, "voice.turn_trigger": trigger})
+      attributes = {"session.id": self.session_id, "voice.turn_trigger": trigger}
+      if carried:
+        attributes["voice.wait_carried_over"] = True  # the wait began in the previous, silent turn
+      self.span = _tracer.start_span("model_turn", start_time=self.start_ns, attributes=attributes)
       self.agent = ""
     self.set_agent(agent)
 
@@ -263,7 +286,7 @@ class _TurnTracker:
       # turns separately, since they reach the model by different paths
       # (streamed audio vs. a complete text message).
       if self.trigger in self._USER_TRIGGERS:
-        ms = (time.time_ns() - self.start_ns) / 1e6
+        ms = (time.time_ns() - self.wait_start_ns) / 1e6  # [#5b] from when the caller started waiting
         self.span.set_attribute("voice.time_to_first_audio_ms", round(ms))
         _ttfa.record(ms, {"agent": agent, "trigger": self.trigger})
 
@@ -293,6 +316,12 @@ class _TurnTracker:
 
   def end(self, outcome: str):
     if self.span is not None:
+      # [#5b] Silent IN_PROGRESS end of a caller's turn: the wait goes on.
+      # Any other end (idle, interrupted, session_closed) closes the wait.
+      if outcome == "in_progress" and not self.got_audio and self.trigger in self._USER_TRIGGERS:
+        self._carried_wait = (self.wait_start_ns, self.trigger)
+      else:
+        self._carried_wait = None
       self.span.set_attribute("voice.turn_outcome", outcome)
       self.span.end()
       _turns.add(1, {"outcome": outcome})
