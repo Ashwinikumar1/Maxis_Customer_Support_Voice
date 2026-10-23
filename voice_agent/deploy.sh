@@ -24,7 +24,8 @@ VERSION="$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)"
 echo "== APIs"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
   aiplatform.googleapis.com discoveryengine.googleapis.com storage.googleapis.com \
-  cloudtrace.googleapis.com telemetry.googleapis.com monitoring.googleapis.com logging.googleapis.com --project "$PROJECT"
+  cloudtrace.googleapis.com telemetry.googleapis.com monitoring.googleapis.com logging.googleapis.com \
+  dlp.googleapis.com --project "$PROJECT"
 
 echo "== Service account (least privilege)"
 gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 || \
@@ -51,6 +52,14 @@ for role in roles/aiplatform.user roles/discoveryengine.viewer roles/serviceusag
   retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
     --role "$role" --condition None --quiet
 done
+if [[ "${REDACT_TRANSCRIPTS:-regex}" == "dlp" ]]; then   # Cloud DLP redaction of transcripts
+  retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$SA" \
+    --role roles/dlp.user --condition None --quiet
+fi
+# Real gateway: the runtime service account needs roles/run.invoker on the gateway's
+# Cloud Run service, granted by the gateway's owner (Maxis), e.g.:
+#   gcloud run services add-iam-policy-binding <gateway> --region asia-southeast1 \
+#     --member serviceAccount:$SA --role roles/run.invoker --project <gateway project>
 if [[ -n "${GCS_BUCKET:-}" ]]; then
   retry gcloud storage buckets add-iam-policy-binding "gs://$GCS_BUCKET" \
     --member "serviceAccount:$SA" --role roles/storage.objectCreator --quiet
@@ -68,6 +77,15 @@ ENV_VARS=(
   "FAQ_SEARCH_ENGINE_ID=$FAQ_SEARCH_ENGINE_ID"
   "GCS_BUCKET=${GCS_BUCKET:-}"
   "GCS_LOG_PREFIX=$GCS_LOG_PREFIX"
+  "ROUTING_MODE=${ROUTING_MODE:-faq_first}"
+  "GATEWAY_URL=${GATEWAY_URL:-mock}"
+  "GATEWAY_AUTH=${GATEWAY_AUTH:-auto}"
+  "GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-30}"
+  "ALLOW_TEST_CALLERS=${ALLOW_TEST_CALLERS:-true}"
+  "MOCK_RESET_ON_CALL=${MOCK_RESET_ON_CALL:-true}"
+  "MOCK_PASS_HISTORY=${MOCK_PASS_HISTORY:-true}"
+  "REDACT_TRANSCRIPTS=${REDACT_TRANSCRIPTS:-regex}"
+  "DLP_INFO_TYPES=${DLP_INFO_TYPES:-PHONE_NUMBER,EMAIL_ADDRESS,CREDIT_CARD_NUMBER,PERSON_NAME,STREET_ADDRESS,PASSPORT}"
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
   "ALLOWED_ORIGINS=$SERVICE_URL"
@@ -120,6 +138,8 @@ gcloud run deploy "$SERVICE" \
   --set-env-vars "$ENV_ARG"
 
 echo
+echo "Note: the mock gateway keeps demo state in memory per instance. For consistent demos set"
+echo "      CLOUD_RUN_MAX_INSTANCES=1 while GATEWAY_URL=mock."
 echo "UI:     $SERVICE_URL"
 echo "Traces:  https://console.cloud.google.com/traces/explorer?project=${PROJECT}"
 echo "Metrics: https://console.cloud.google.com/monitoring/metrics-explorer?project=${PROJECT}"

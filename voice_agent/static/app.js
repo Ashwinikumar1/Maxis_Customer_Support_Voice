@@ -11,6 +11,15 @@
   const textForm = $("textForm");
   const textInput = $("textInput");
   const sendBtn = $("sendBtn");
+  const callerSelect = $("callerSelect");
+  const callerHint = $("callerHint");
+  const modePill = $("modePill");
+  const failBtn = $("failBtn");
+  const handoverEl = $("handover");
+  const handoverTitle = $("handoverTitle");
+  const handoverBody = $("handoverBody");
+  let callers = [];
+  let endingCall = false; // the agent ended the call: let the goodbye finish before closing audio
 
   let ws = null;
   let micStream = null;
@@ -30,6 +39,8 @@
     micBtn.classList.toggle("danger", connected);
     textInput.disabled = !connected;
     sendBtn.disabled = !connected;
+    callerSelect.disabled = connected;
+    failBtn.disabled = !connected || !failBtn.dataset.enabled;
     if (!connected) agentPill.textContent = "offline";
   }
 
@@ -107,10 +118,23 @@
       case "tool_result": {
         const r = msg.response || {};
         if (msg.name !== "transfer_to_agent") {
-          addActivity("tool", `${msg.name} → ${r.status || (r.error ? "error" : "done")}`);
+          // Gateway envelope: show next_step, or the violation code when it failed.
+          const v = (r.violations && r.violations[0]) || null;
+          const step = (r.responseData && r.responseData.next_step) || r.next_step;
+          const what = v ? `fail ${v.code}` : step || r.status || (r.error ? "error" : "done");
+          addActivity("tool", `${msg.name} → ${what}`);
         }
         break;
       }
+      case "handover":
+        showHandover(msg);
+        break;
+      case "call_ended":
+        addActivity("handover", "Call ended by the agent");
+        setStatus("Call ended", "");
+        endingCall = true;
+        setTimeout(() => { endingCall = false; stop(); setStatus("Call ended", ""); }, 3000);
+        break;
       case "interrupted":
         if (playerNode) playerNode.port.postMessage({ command: "clear" });
         closeBubble("agent");
@@ -173,7 +197,7 @@
 
     ws.onopen = () => {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      ws.send(JSON.stringify({ type: "init", timezone }));
+      ws.send(JSON.stringify({ type: "init", timezone, caller: callerSelect.value }));
       setConnected(true);
       setStatus("Listening", "on");
       agentPill.textContent = "voice_assistant";
@@ -186,6 +210,7 @@
       }
     };
     ws.onclose = () => {
+      if (endingCall) return; // stop() runs after the goodbye has played
       stop();
       setStatus("Disconnected", "");
     };
@@ -205,8 +230,77 @@
     setStatus("Not connected", "");
   }
 
+  // ---------- Handover card (end_session) ----------
+  const LABELS = {
+    intent: "Intent", summary: "Summary", language: "Language", use_case: "Use case",
+    destination: "Destination", pass: "Pass", customer_request: "Customer wanted",
+  };
+
+  function showHandover({ session_escalated, reason, params, agent }) {
+    handoverEl.hidden = false;
+    handoverEl.className = "handover " + (session_escalated ? "escalated" : "contained");
+    handoverTitle.textContent = session_escalated
+      ? "Escalated to a person (Genesys would route to a queue)"
+      : "Completed by the bot";
+    handoverBody.replaceChildren();
+    const rows = [["Reason", reason], ["Ended by", agent]];
+    for (const [k, label] of Object.entries(LABELS)) {
+      if (params && params[k]) rows.push([label, params[k]]);
+    }
+    for (const [k, v] of rows) {
+      if (!v) continue;
+      const dt = document.createElement("dt");
+      dt.textContent = k;
+      const dd = document.createElement("dd");
+      dd.textContent = String(v);
+      handoverBody.append(dt, dd);
+    }
+    addActivity("handover", session_escalated ? "end_session: escalated" : "end_session: completed");
+  }
+
+  // ---------- Test callers ----------
+  function showHint() {
+    const c = callers.find((x) => x.key === callerSelect.value);
+    callerHint.textContent = c ? "Try: " + c.hint : "";
+  }
+
+  async function loadCallers() {
+    try {
+      const res = await fetch("/api/test-callers");
+      const data = await res.json();
+      callers = data.callers || [];
+      modePill.textContent = `routing: ${data.routing_mode} · gateway: ${data.gateway}`;
+      if (data.gateway === "mock") failBtn.dataset.enabled = "1";
+    } catch (err) {
+      callers = [];
+    }
+    callerSelect.replaceChildren();
+    for (const c of callers) {
+      const opt = document.createElement("option");
+      opt.value = c.key;
+      opt.textContent = c.label;
+      callerSelect.appendChild(opt);
+    }
+    if (!callers.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No test callers (withheld)";
+      callerSelect.appendChild(opt);
+    }
+    showHint();
+  }
+
+  callerSelect.addEventListener("change", showHint);
+
+  failBtn.addEventListener("click", () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: "mock", action: "fail_next", operation: "*", count: 2 }));
+    addActivity("error", "Mock gateway: next 2 roaming calls will fail");
+  });
+
   micBtn.addEventListener("click", async () => {
     if (ws) return stop();
+    handoverEl.hidden = true;
     try {
       await start();
     } catch (err) {
@@ -227,4 +321,5 @@
     ws.send(JSON.stringify({ type: "text", data: text }));
     textInput.value = "";
   });
+  loadCallers();
 })();

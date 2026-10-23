@@ -22,6 +22,10 @@ Try: *"What roaming passes do you have?"*, *"How do I turn on roaming?"*,
 
 FAQ search latency check: `uv run python scripts/bench_faq_search.py`
 
+Pick a **Test caller** in the header before you start (demo accounts in the mock gateway), then try
+*"I'm going to Tokyo next Friday for a week, can you set up a roaming pass?"*.
+Full test guide: [`TESTING.md`](TESTING.md). Unit tests: `uv run pytest -q`.
+
 ## Configuration (`.env`)
 Every setting is documented in [`.env.example`](.env.example). Both the local
 server and `deploy.sh` read the same file.
@@ -33,6 +37,10 @@ server and `deploy.sh` read the same file.
 | `DEFAULT_TIMEZONE` | Used for the date in the prompt when the client sends none |
 | `FAQ_SEARCH_ENGINE_ID` | Vertex AI Search app with the Maxis FAQ |
 | `GCS_BUCKET`, `GCS_LOG_PREFIX` | Transcript destination (empty bucket = `./transcripts/`) |
+| `REDACT_TRANSCRIPTS`, `DLP_INFO_TYPES` | Personal data removed before storing: `none`, `regex` (default) or `dlp` (Cloud DLP) |
+| `ROUTING_MODE` | `faq_first` (design v0.3, default) or `specialist` (production-style roaming routing) |
+| `GATEWAY_URL`, `GATEWAY_AUTH`, `GATEWAY_TIMEOUT_S` | Agent gateway: `mock`, the standalone mock, or the real `https://` gateway (Google ID token) |
+| `ALLOW_TEST_CALLERS`, `MOCK_RESET_ON_CALL`, `MOCK_PASS_HISTORY` | Browser test-caller picker and mock behaviour |
 | `OTEL_TO_CLOUD`, `OTEL_SERVICE_NAME`, `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` | OpenTelemetry export |
 | `HOST`, `PORT`, `ALLOWED_ORIGINS` | Local server and allowed browser origins for `/ws` |
 | `CLOUD_RUN_*` | Region, service name, service account, min/max instances (deploy only) |

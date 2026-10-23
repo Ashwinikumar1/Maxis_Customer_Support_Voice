@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .redaction import redact_transcript
 from .utils import logger
 
 
@@ -61,6 +62,14 @@ class TranscriptLogger:
     if GCS_BUCKET is unset OR the upload fails (e.g. expired credentials),
     the transcript is written to ./transcripts/ instead."""
     self.data["session_end"] = _now()
+    try:  # personal data out before anything is stored (design section 7)
+      await asyncio.to_thread(redact_transcript, self.data)
+    except Exception:  # never store unredacted speech: drop the text instead
+      logger.exception("Transcript redaction failed; text removed")
+      for entry in self.data["conversation"]:
+        if "text" in entry:
+          entry["text"] = "[redaction failed]"
+      self.data["metadata"]["redaction"] = "failed"
     payload = json.dumps(self.data, ensure_ascii=False, indent=2)
     if self.bucket:
       try:

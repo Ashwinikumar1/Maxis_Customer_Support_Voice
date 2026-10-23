@@ -25,6 +25,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # App code + UI + observability launcher (its tests are not shipped).
 COPY streaming_core ./streaming_core
 COPY voice_assistant ./voice_assistant
+COPY mock_gateway ./mock_gateway
 COPY static ./static
 COPY server.py ./
 COPY observability ./observability

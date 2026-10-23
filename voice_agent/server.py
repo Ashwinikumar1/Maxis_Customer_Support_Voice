@@ -3,13 +3,21 @@
 One WebSocket per conversation at ws://HOST:PORT/ws; the browser UI is served
 on the same port. Transcript is dumped to GCS when the session ends.
 
-client -> server : {"type":"init","timezone"} {"type":"audio","data":b64 PCM16 16k}
+client -> server : {"type":"init","timezone","caller"} {"type":"audio","data":b64 PCM16 16k}
                    {"type":"text","data":"..."} {"type":"ping"} {"type":"end"}
-server -> client : {"type":"ready"} {"type":"audio","data":b64 PCM16 24k}
+                   {"type":"mock","action":"fail_next","operation","count"}   (mock gateway only)
+server -> client : {"type":"ready","routing_mode","gateway"} {"type":"audio","data":b64 PCM16 24k}
                    {"type":"transcript","role","text","partial","author"}
                    {"type":"tool_call","name","args","author"} {"type":"active_agent","name"}
                    {"type":"tool_result","name","response","author"}
                    {"type":"interrupted"} {"type":"turn_complete","state"} {"type":"error"}
+                   {"type":"handover","session_escalated","reason","params","agent"}
+                   {"type":"call_ended"}
+
+"caller" picks a test caller (GET /api/test-callers) whose number becomes the
+session's caller_id, as Genesys' calling number will. The browser never sends a
+phone number itself. When an agent calls end_session, the server sends
+"handover", lets the goodbye finish, then sends "call_ended" and closes.
 
 Run:  uv run python server.py   ->  http://127.0.0.1:8080
 """
@@ -50,7 +58,8 @@ from websockets.http11 import Response  # noqa: E402
 from streaming_core import (  # noqa: E402
     LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
 from streaming_core.utils import current_session_id, shutdown_requested  # noqa: E402
-from voice_assistant.agent import create_root_agent  # noqa: E402
+from voice_assistant import gateway_client  # noqa: E402
+from voice_assistant.agent import create_root_agent, routing_mode  # noqa: E402
 from opentelemetry import metrics, trace  # noqa: E402
 from opentelemetry.trace import Link, SpanContext, TraceFlags  # noqa: E402
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator  # noqa: E402
@@ -105,6 +114,10 @@ _session_duration = _meter.create_histogram(
     "voice.session.duration", unit="s", description="Voice call duration, by outcome and close_reason")
 _sessions_finished = _meter.create_counter(
     "voice.sessions", description="Finished voice calls, by outcome and close_reason")
+# Business outcome of each call for the design's dashboards (section 8):
+# containment rate = contained / all calls; handoff rate = escalated / all calls.
+_calls = _meter.create_counter(
+    "voice.calls", description="Finished calls by business outcome (contained, escalated, abandoned)")
 
 # =============================================================================
 # 2. Configuration (all overridable from .env)
@@ -120,6 +133,19 @@ ALLOWED_ORIGINS = {
 }
 INIT_TIMEOUT_S = 5.0        # how long to wait for the client's {"type":"init"} message
 MAX_B64_LEN = 512 * 1024    # reject oversized audio frames (DoS protection)
+END_GRACE_S = 1.5           # after end_session: let the last audio reach the client
+END_MAX_WAIT_S = 15.0       # ... but never keep the call open longer than this
+
+# Test callers for the browser client: the picker's choice becomes the session's
+# caller_id (Genesys will pass the real calling number instead). Turn off when
+# the browser client is exposed beyond the delivery team.
+ALLOW_TEST_CALLERS = os.getenv("ALLOW_TEST_CALLERS", "true").lower() == "true"
+MOCK_RESET_ON_CALL = os.getenv("MOCK_RESET_ON_CALL", "true").lower() == "true"
+if ALLOW_TEST_CALLERS:
+  from mock_gateway import TEST_CALLERS
+  _CALLERS = {c["key"]: c for c in TEST_CALLERS}
+else:
+  _CALLERS = {}
 
 # ADK SessionService stores conversation history/state per session.
 # Created ONCE and shared by all connections (per ADK custom-server guidance).
@@ -170,6 +196,12 @@ def process_request(connection, request):
     if request.headers.get("Origin") not in ALLOWED_ORIGINS:  # cross-site WS hijacking
       return _http(HTTPStatus.FORBIDDEN, b"Forbidden")
     return None  # continue WebSocket handshake
+  if path == "/api/test-callers":
+    # Labels and hints only; the numbers stay on the server.
+    callers = [{"key": c["key"], "label": c["label"], "hint": c["hint"]} for c in _CALLERS.values()]
+    body = json.dumps({"callers": callers, "routing_mode": routing_mode(),
+                       "gateway": "mock" if gateway_client.is_mock() else "remote"}).encode()
+    return _http(HTTPStatus.OK, body, "application/json")
   name = _ROUTES.get(path)
   if not name:
     return _http(HTTPStatus.NOT_FOUND, b"Not found")
@@ -250,18 +282,22 @@ async def handle_client(websocket):
 async def _handle_client(websocket):
   client_id = uuid.uuid4().hex  # random, unguessable id for this connection
   send = lambda payload: websocket.send(json.dumps(payload))  # noqa: E731
-  await send({"type": "ready"})
+  await send({"type": "ready", "routing_mode": routing_mode(),
+              "gateway": "mock" if gateway_client.is_mock() else "remote"})
 
-  # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone.
-  # The timezone drives the greeting and the date/time injected into the prompt.
-  # If the client never sends it, fall back to DEFAULT_TIMEZONE after 5 s.
+  # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone
+  # and the chosen test caller. The timezone drives the greeting; roaming dates
+  # are always Malaysia time. If the client never sends init, fall back to
+  # DEFAULT_TIMEZONE and a withheld number after 5 s.
   timezone = None
+  caller_key = ""
   try:
     async with asyncio.timeout(INIT_TIMEOUT_S):
       while True:
         msg = _parse(await websocket.recv())
         if msg.get("type") == "init":
           timezone = str(msg.get("timezone") or "")[:64] or None
+          caller_key = str(msg.get("caller") or "")[:32]
           break
   except TimeoutError:
     # [Observability #9c] Previously a silent `pass`. The timezone drives the
@@ -271,8 +307,16 @@ async def _handle_client(websocket):
     logger.info("No init message within %.0f s - using the default timezone", INIT_TIMEOUT_S)
   ctx = get_datetime_info(timezone)  # {"timezone","date","time","greeting"}
 
+  # caller_id: the calling number, as Genesys will pass it. In the browser it
+  # comes from the server-side test-caller table, never from the client.
+  caller = _CALLERS.get(caller_key)
+  caller_id = caller["msisdn"] if caller else ""
+  if caller_id and gateway_client.is_mock() and MOCK_RESET_ON_CALL:
+    from mock_gateway import gateway
+    gateway().reset(caller_id)  # every demo call starts from the same account state
+
   # --- 4b. Build the per-conversation ADK objects.
-  #   session_service.create_session -> fresh ADK session (history + state=ctx)
+  #   session_service.create_session -> fresh ADK session (history + state=ctx + caller_id)
   #   Runner                         -> executes the agent tree for this session
   #   create_root_agent(ctx)         -> new agent tree with today's date/greeting
   #   TranscriptLogger               -> collects turns, uploaded to GCS at the end
@@ -287,8 +331,10 @@ async def _handle_client(websocket):
   # ended on it ([Observability #9c]).
   call_span = trace.get_current_span()
   call_span.set_attribute("session.id", session_id)  # match trace <-> transcript
+  call_span.set_attribute("voice.test_caller", caller_key or "withheld")
   span_ctx = call_span.get_span_context()
-  await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
+  await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id,
+                                       state={**ctx, "caller_id": caller_id})
   runner = Runner(app_name=APP_NAME, agent=create_root_agent(ctx), session_service=session_service)
   # [Observability #8a] Put the call's trace ID into the transcript file.
   # WHY: transcripts are what QA and complaint handling actually read. Before,
@@ -299,10 +345,17 @@ async def _handle_client(websocket):
   # the other way: trace -> transcript.) None when tracing is off (local runs);
   # TranscriptLogger then leaves the field out.
   transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"],
-                                trace_id=f"{span_ctx.trace_id:032x}" if span_ctx.is_valid else None)
+                                trace_id=f"{span_ctx.trace_id:032x}" if span_ctx.is_valid else None,
+                                routing_mode=routing_mode(), test_caller=caller_key or "withheld",
+                                caller_id=_mask(caller_id),
+                                gateway="mock" if gateway_client.is_mock() else "remote")
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
                              run_config=default_run_config(VOICE_NAME), transcript=transcript)
-  logger.info("Session %s started (%s)", session_id, ctx["timezone"])
+  logger.info("Session %s started (%s, caller %s)", session_id, ctx["timezone"], caller_key or "withheld")
+
+  ended = asyncio.Event()       # set when an agent has ended the call with end_session
+  outcome: dict = {}            # end_session result, once called
+  last_agent = {"name": ""}
 
   # --- 4c. UPSTREAM task: browser -> Gemini.
   # Reads WebSocket messages and pushes them into the session's LiveRequestQueue:
@@ -345,6 +398,8 @@ async def _handle_client(websocket):
         session.send_text(str(msg.get("data", "")))
       elif kind == "ping":
         await send({"type": "pong"})
+      elif kind == "mock":
+        _mock_control(msg)
       elif kind == "end":
         return "client_end"           # [#9c] the caller ended the call normally
     return "client_disconnect"        # [#9c] the socket closed without "end" (network drop, tab closed)
@@ -354,22 +409,51 @@ async def _handle_client(websocket):
   # Here we only translate to the browser's JSON protocol: audio bytes are
   # base64-encoded, every other event is forwarded as-is. A telephony channel
   # (e.g. Genesys) would provide its own emit() with audio format conversion.
+  # end_session: forward the handover, then end once the goodbye turn is done.
+  loop = asyncio.get_running_loop()
+
   async def emit(kind, **data):
     if kind == "audio":
       await send({"type": "audio", "data": base64.b64encode(data["data"]).decode()})
-    else:
-      await send({"type": kind, **data})
+      return
+    await send({"type": kind, **data})
+    if kind == "active_agent":
+      last_agent["name"] = data.get("name", "")
+    elif kind == "tool_call" and data.get("name") == "end_session":
+      last_agent["end_args"] = dict(data.get("args") or {})
+    elif kind == "tool_result" and data.get("name") == "end_session" and not outcome:
+      # The tool's cleaned result is in session state; fall back to the call's args.
+      stored = await session_service.get_session(app_name=APP_NAME, user_id=user_id, session_id=session_id)
+      saved = stored.state.get("end_session") if stored else None
+      if not saved:
+        args = last_agent.get("end_args", {})
+        saved = {"session_escalated": bool(args.get("session_escalated")), "reason": args.get("reason", ""),
+                 "agent": data.get("author", ""),
+                 "params": {k: v for k, v in args.items() if k not in ("session_escalated", "reason")}}
+      outcome.update(saved)
+      transcript.add_event("end_session", **outcome)
+      await send({"type": "handover", **outcome})
+      loop.call_later(END_MAX_WAIT_S, ended.set)
+    elif kind == "turn_complete" and outcome and data.get("state") != "IN_PROGRESS":
+      loop.call_later(END_GRACE_S, ended.set)
+
+  async def wait_for_end():
+    await ended.wait()
+    await send({"type": "call_ended"})
 
   # --- 4e. Run upstream and downstream CONCURRENTLY.
   # Both directions must be live at the same time so the user can interrupt
-  # (barge in) while the model is speaking. When either side finishes
-  # (browser disconnects, "end", or a Live API error) we tear everything down.
+  # (barge in) while the model is speaking. When any task finishes (browser
+  # disconnects, "end", an agent's end_session, or a Live API error) we tear
+  # everything down.
   #
   # [Observability #9c] Record WHY every call ended.
   # The possible values, and what each one means for the caller:
   #   client_end          - the caller ended the call normally ("end" message)
   #   client_disconnect   - the connection dropped without "end" (network
   #                         problem, browser tab closed, phone lost signal)
+  #   agent_end_session   - an agent ended the call with end_session (done, or
+  #                         escalated to a person: see voice.calls / the transcript)
   #   live_session_ended  - the Gemini Live session finished on its own
   #   error               - something failed in our code or the Live API
   #   server_shutdown     - this server instance was stopped (e.g. Cloud Run
@@ -378,14 +462,12 @@ async def _handle_client(websocket):
   # line, so "how many calls drop unexpectedly?" - the most basic health
   # question for a voice line - could not be answered. Now the reason is put on
   # the voice_session span (attribute voice.close_reason), in the closing log
-  # line, and (via the observability add-on) on the voice.sessions metric, so
-  # it can be charted and alerted on. A rise in client_disconnect points to
-  # network problems; a rise in server_shutdown means deploys are cutting
-  # live calls.
+  # line, and on the voice.sessions metric, so it can be charted and alerted on.
   close_reason = "unknown"
   started = time.monotonic()
   _sessions_active.add(1)  # [#13] matched by add(-1) in the `finally` below
-  tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
+  tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit)),
+           asyncio.create_task(wait_for_end())]
   try:
     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in done:
@@ -397,6 +479,8 @@ async def _handle_client(websocket):
         close_reason = "client_disconnect"
       elif task is tasks[0]:
         close_reason = task.result()
+      elif task is tasks[2]:
+        close_reason = "agent_end_session"
       else:
         close_reason = "live_session_ended"
     # [#9c] During a shutdown the server closes every socket itself, which the
@@ -419,7 +503,7 @@ async def _handle_client(websocket):
     except ConnectionClosed:
       pass
   finally:
-    # --- 4f. Cleanup (always runs): stop both tasks, close the Live connection,
+    # --- 4f. Cleanup (always runs): stop the tasks, close the Live connection,
     # upload the transcript ONCE to GCS, then close the browser socket.
     for task in tasks:
       task.cancel()
@@ -432,11 +516,18 @@ async def _handle_client(websocket):
     # the Live API; every other ending (hang-up, network drop, shutdown) is
     # "ok" - the close_reason attribute tells those apart.
     duration_s = time.monotonic() - started
-    outcome = "error" if close_reason == "error" else "ok"
-    call_metric_attrs = {"outcome": outcome, "close_reason": close_reason}
+    outcome_attr = "error" if close_reason == "error" else "ok"
+    call_metric_attrs = {"outcome": outcome_attr, "close_reason": close_reason}
     _sessions_active.add(-1)
     _session_duration.record(duration_s, call_metric_attrs)
     _sessions_finished.add(1, call_metric_attrs)
+    # Business outcome of the call (design section 8): contained = the bot
+    # finished it, escalated = handed to a person, abandoned = no end_session.
+    result = ("escalated" if outcome.get("session_escalated") else "contained") if outcome else "abandoned"
+    params = outcome.get("params") or {}
+    _calls.add(1, {"outcome": result, "intent": params.get("intent", "none"),
+                   "routing_mode": routing_mode(), "last_agent": outcome.get("agent") or last_agent["name"]})
+    transcript.set_metadata("outcome", result)
     # [Observability #12] Token usage of this call, taken ONCE here and used
     # everywhere: the transcript (saved next, so it must be set first), the
     # call's span and the closing log line below, and the voice.call.tokens
@@ -457,6 +548,7 @@ async def _handle_client(websocket):
     #   invalid_audio=0, invalid_messages=0)
     call_span.set_attributes({
         "voice.close_reason": close_reason,
+        "voice.call_outcome": result,
         "voice.dropped.invalid_audio": dropped["invalid_audio"],
         "voice.dropped.invalid_message": dropped["invalid_message"],
         # [#12] e.g. voice.tokens.input, voice.tokens.output, voice.tokens.total,
@@ -464,10 +556,27 @@ async def _handle_client(websocket):
         **{f"voice.tokens.{key}": value for key, value in tokens.items()},
     })
     # [#12] Tokens are in the same closing line; "n/a" means no usage report arrived.
-    logger.info("Session %s closed (reason=%s, duration=%.1fs, invalid_audio=%d, invalid_messages=%d, "
-                "tokens_in=%s, tokens_out=%s, tokens_total=%s)",
-                session_id, close_reason, duration_s, dropped["invalid_audio"], dropped["invalid_message"],
-                tokens.get("input", "n/a"), tokens.get("output", "n/a"), tokens.get("total", "n/a"))
+    logger.info("Session %s closed (reason=%s, outcome=%s, duration=%.1fs, invalid_audio=%d, "
+                "invalid_messages=%d, tokens_in=%s, tokens_out=%s, tokens_total=%s)",
+                session_id, close_reason, result, duration_s, dropped["invalid_audio"],
+                dropped["invalid_message"], tokens.get("input", "n/a"), tokens.get("output", "n/a"),
+                tokens.get("total", "n/a"))
+
+
+def _mask(msisdn: str) -> str:
+  """Keeps only the last 4 digits of a number for logs and transcripts."""
+  return ("*" * max(0, len(msisdn) - 4) + msisdn[-4:]) if msisdn else ""
+
+
+def _mock_control(msg: dict):
+  """Demo controls from the browser, honoured only with the in-process mock gateway."""
+  if not (ALLOW_TEST_CALLERS and gateway_client.is_mock()):
+    return
+  if msg.get("action") == "fail_next":
+    from mock_gateway import gateway
+    count = msg.get("count", 2)
+    gateway().fail_next(str(msg.get("operation") or "*")[:40], count if isinstance(count, int) else 2)
+    logger.info("Mock gateway: next %s call(s) will fail", count)
 
 
 # =============================================================================
