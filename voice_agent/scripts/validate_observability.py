@@ -122,8 +122,20 @@ def check_settings(gcp, env, region, service):
 
   check(tmpl.get("timeout") == "3600s", "Request timeout 3600 s (long calls)", detail_bad=f"is {tmpl.get('timeout')}")
   check(tmpl.get("sessionAffinity") is True, "Session affinity on")
-  check(container.get("resources", {}).get("cpuIdle") is False, "CPU always allocated (--no-cpu-throttling)",
-        detail_bad="CPU is throttled between requests: telemetry export can stall")
+  # The v2 API omits cpuIdle when it is false, so read Cloud Run's own setting
+  # (the run.googleapis.com/cpu-throttling annotation that --no-cpu-throttling sets).
+  try:
+    v1 = gcp.call("GET", f"https://{region}-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/"
+                         f"{gcp.project}/services/{service}")
+    throttling = v1["spec"]["template"]["metadata"].get("annotations", {}).get("run.googleapis.com/cpu-throttling")
+  except (RuntimeError, KeyError):
+    throttling = None
+  if throttling is None:
+    throttling = "true" if container.get("resources", {}).get("cpuIdle") else "unknown"
+  check(throttling == "false", "CPU always allocated (--no-cpu-throttling)",
+        detail_bad=("CPU is cut between requests, so telemetry export can stall - run ./deploy.sh" if throttling == "true"
+                    else "could not read the setting - check Cloud Run > Edit > CPU is always allocated"),
+        bad="FAIL" if throttling == "true" else "WARN")
 
   sa = tmpl.get("serviceAccount", "")
   policy = gcp.call("POST", f"https://cloudresourcemanager.googleapis.com/v1/projects/{gcp.project}:getIamPolicy", json={})
@@ -136,19 +148,44 @@ def check_settings(gcp, env, region, service):
 
 
 # --------------------------------------------------------------------------- 2. test call
+def _who_refused(exc):
+  """The app answers 403 with the body 'Forbidden'; Cloud Run's own 403 is an HTML page."""
+  body = (exc.response.body or b"").decode("utf-8", "replace").strip()
+  return "app" if body == "Forbidden" else "cloud_run", body[:120].replace("\n", " ")
+
+
 async def make_test_call(base_url):
+  """Returns True if the test call connected (so its evidence can be looked up)."""
   print("\n2. Test call")
   scheme, host = base_url.split("://", 1)
   ws_url = f"{'wss' if scheme == 'https' else 'ws'}://{host}/ws"
-  try:  # [security] a connection from another website must be refused
+  report("INFO", "Calling", f"{ws_url} with Origin {base_url} (from the service's ALLOWED_ORIGINS)")
+  try:  # [security] a connection from another website must be refused BY THE APP
     async with connect(ws_url, origin="https://evil.example", open_timeout=15):
       report("FAIL", "Foreign-origin connection refused", "it was ACCEPTED")
   except InvalidStatus as exc:
-    check(exc.response.status_code == 403, "Foreign-origin connection refused (HTTP 403)",
-          detail_bad=f"got HTTP {exc.response.status_code}")
+    who, body = _who_refused(exc)
+    check(exc.response.status_code == 403 and who == "app", "Foreign-origin connection refused by the app (HTTP 403)",
+          detail_bad=f"HTTP {exc.response.status_code} from {who}: {body}")
 
   got = {"audio_after_question": False, "types": set()}
-  async with connect(ws_url, origin=base_url, open_timeout=20, max_size=2**22) as ws:
+  try:
+    ws = await connect(ws_url, origin=base_url, open_timeout=20, max_size=2**22)
+  except InvalidStatus as exc:
+    who, body = _who_refused(exc)
+    if who == "app":
+      hint = ("the app refused our Origin: ALLOWED_ORIGINS does not match the URL - compare it with the URL "
+              "./deploy.sh printed")
+    else:
+      hint = ("Cloud Run refused the request before the app saw it - usually public access (allUsers -> "
+              "roles/run.invoker) is not granted, e.g. blocked by an organisation policy, or ingress is restricted")
+    report("FAIL", "Test call connected", f"HTTP {exc.response.status_code}: {hint}. Body: {body}")
+    return False
+  except OSError as exc:
+    report("FAIL", "Test call connected", f"{type(exc).__name__}: {exc}")
+    return False
+  report("PASS", "Test call connected")
+  try:
     async def reader():
       async for raw in ws:
         kind = json.loads(raw).get("type")
@@ -169,8 +206,11 @@ async def make_test_call(base_url):
     await ws.send(json.dumps({"type": "end"}))
     await asyncio.sleep(1)
     task.cancel()
+  finally:
+    await ws.close()
   check(got["audio_after_question"], "Agent answered the typed question with audio",
         detail_bad=f"no answer audio within 30 s (received: {sorted(t for t in got['types'] if t)})")
+  return True
 
 
 # --------------------------------------------------------------------------- 3a. logs
@@ -379,8 +419,8 @@ def main():
   if not args.no_call:
     since = datetime.now(timezone.utc) - timedelta(seconds=5)
     base_url = run_env.get("ALLOWED_ORIGINS", "").split(",")[0]
-    asyncio.run(make_test_call(base_url))
-    sid, trace_id = check_logs(gcp, service, since)
+    connected = asyncio.run(make_test_call(base_url))
+    sid, trace_id = check_logs(gcp, service, since) if connected else (None, None)
     if sid:
       check_trace(gcp, trace_id, sid, run_env.get("FAQ_SEARCH_ENGINE_ID"), version)
       check_transcript(gcp, run_env.get("GCS_BUCKET"), run_env.get("GCS_LOG_PREFIX", "VoiceAgentLogs"), sid, trace_id)
