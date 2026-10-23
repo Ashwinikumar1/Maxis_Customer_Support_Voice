@@ -2,6 +2,7 @@
 # One command for the usual local tasks. Run from anywhere:
 #
 #   voice_agent/scripts/dev.sh setup       # check tools + Google sign-in, update .env, install deps
+#                                          #   (setup --rebuild: .env in the template layout, all comments)
 #   voice_agent/scripts/dev.sh test        # all tests that need no cloud access (~1 min)
 #   voice_agent/scripts/dev.sh scenarios   # test-plan + roaming scenarios on the real model [--judge -v ...]
 #   voice_agent/scripts/dev.sh run         # start the server as Cloud Run does -> http://127.0.0.1:8080
@@ -65,6 +66,6 @@ case "${1:-help}" in
   deploy)    ./deploy.sh ;;
   validate)  shift; uv run python scripts/validate_observability.py "$@" ;;
   all)       shift; setup; run_tests; uv run python scripts/run_scenarios.py "$@" ;;
-  help|-h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "Unknown command '$1'. Try: setup, test, scenarios, run, mock, deploy, validate, all" ;;
 esac

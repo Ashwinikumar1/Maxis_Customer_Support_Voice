@@ -39,6 +39,11 @@ This does everything:
 | `scripts/dev.sh deploy` / `validate` | Section 6: deploy, then check traces, logs and metrics in Google Cloud |
 | `scripts/dev.sh all` | setup + test + scenarios |
 
+Every setting in `.env.example` has a comment above it saying what it does, its allowed values, the
+default when it's empty, and when to change it. `scripts/dev.sh setup` copies those comments for the
+settings it adds. To get them for **every** setting in your existing `.env` too, keeping all your values:
+`scripts/dev.sh setup --rebuild` (or `python3 scripts/setup_env.py --rebuild`). It makes a backup first.
+
 To change one setting without opening `.env`:
 `python3 scripts/setup_env.py --set ROUTING_MODE=specialist`. To see what's missing without changing
 anything: `python3 scripts/setup_env.py --check`.
