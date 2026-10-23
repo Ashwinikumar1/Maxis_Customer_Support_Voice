@@ -34,6 +34,15 @@ def _free_port() -> int:
 
 class LauncherEndToEnd(unittest.TestCase):
 
+  def setUp(self):
+    # The server under test saves transcripts locally (GCS_BUCKET is empty); remove the ones
+    # these tests create, so `dev.sh test` doesn't leave files in voice_agent/transcripts/.
+    self._transcripts_before = set((APP_DIR / "transcripts").glob("*.json"))
+
+  def tearDown(self):
+    for path in set((APP_DIR / "transcripts").glob("*.json")) - self._transcripts_before:
+      path.unlink(missing_ok=True)
+
   def _start(self, port, spans_file, **extra):
     env = {
         **os.environ, "PORT": str(port), "HOST": "127.0.0.1", "LOG_FORMAT": "json",
@@ -181,6 +190,9 @@ class LauncherEndToEnd(unittest.TestCase):
     # #8a: the transcript carries the call's trace id.
     saved = next(m for m in messages if m.startswith("Transcript saved locally to "))
     transcript_path = APP_DIR / saved.removeprefix("Transcript saved locally to ")
+    # The file is named by the call's hashed ID (the trace's session.id), never the raw session ID.
+    self.assertIn(f"conversation_{session['attributes']['session.id']}_", saved)
+    self.assertNotIn("conversation_session_", saved)
     try:
       self.assertEqual(json.loads(transcript_path.read_text())["metadata"]["trace_id"], session["trace_id"])
     finally:

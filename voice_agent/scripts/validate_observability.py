@@ -3,18 +3,24 @@
 WHAT IT DOES
   1. Settings: reads the Cloud Run service and IAM, and checks the env vars,
      call settings and service-account roles that the changes rely on.
-  2. Test call: makes ONE short call to the service, built to trigger the rare
+  2. Test calls: makes ONE short call to the service, built to trigger the rare
      cases on purpose: no init message (init timeout), a bad JSON message and a
      bad audio frame (dropped-input counters), then one typed FAQ question.
      Also tries one connection from a foreign website (must get 403).
+     2b. With the mock gateway, a second call as a demo test caller asks a
+     read-only roaming question ("When does my current roaming pass end?"), so
+     the roaming agent and the agent gateway run (nothing is bought or changed).
   3. Evidence: finds that call in Cloud Logging, Cloud Trace, Cloud Monitoring
-     and the transcript bucket, and checks every field the changes added.
+     and the transcript bucket, and checks every field the changes added; for
+     the roaming call: the agent change in the logs, agent_gateway.request spans
+     with the operation and answer, voice.last_agent, voice.gateway.duration,
+     and that the caller's number appears in no log line or span.
   4. History: start-up line of the live revision, shutdown lines from earlier
      deploys, and that no session-resumption handle was ever logged in clear.
 
 Every check prints PASS / FAIL / WARN / INFO with the reason. Exit code 1 if
-anything FAILs. Nothing is changed in the project; the only cost is the one
-short Gemini call (about 1,000 tokens).
+anything FAILs. Nothing is changed in the project; the only cost is two short
+Gemini calls (a few thousand tokens).
 
 NEEDS: `gcloud auth application-default login` (an account that can read Cloud
 Run, IAM, Logging, Trace, Monitoring and the bucket) and voice_agent/.env.
@@ -22,6 +28,7 @@ Run, IAM, Logging, Trace, Monitoring and the bucket) and voice_agent/.env.
 USAGE (from voice_agent/):
   uv run python scripts/validate_observability.py
   uv run python scripts/validate_observability.py --no-call   # settings + history only
+  uv run python scripts/validate_observability.py --no-roaming  # skip the roaming test call
 """
 
 import argparse
@@ -38,9 +45,14 @@ import google.auth
 from dotenv import dotenv_values
 from google.auth.transport.requests import AuthorizedSession
 from websockets.asyncio.client import connect
-from websockets.exceptions import InvalidStatus
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 QUESTION = "Can I schedule my roaming pass before I fly?"
+# Second test call (roaming agent + agent gateway): a read-only question as a demo test caller,
+# so nothing is bought or switched. Runs only when the service uses the mock gateway.
+ROAMING_CALLER = "traveller"            # mock_gateway/data.py: single line with scheduled + active passes
+ROAMING_CALLER_MSISDN = "60100000002"   # must never appear in a span or log line
+ROAMING_QUESTION = "When does my current roaming pass end?"
 PRIVACY_PROBE = "schedule my roaming pass"   # must never appear in a span attribute
 EXPECTED_ROLES = ["roles/aiplatform.user", "roles/discoveryengine.viewer",
                   "roles/serviceusage.serviceUsageConsumer", "roles/telemetry.tracesWriter",
@@ -235,6 +247,104 @@ async def make_test_call(base_url):
   return True
 
 
+async def make_roaming_call(base_url):
+  """A second call that uses the roaming agent and the agent gateway. Returns True if it ran."""
+  print("\n2b. Roaming test call")
+  scheme, host = base_url.split("://", 1)
+  ws_url = f"{'wss' if scheme == 'https' else 'ws'}://{host}/ws"
+  try:
+    ws = await connect(ws_url, origin=base_url, open_timeout=20, max_size=2**22)
+  except (InvalidStatus, OSError) as exc:
+    report("FAIL", "Roaming test call connected", f"{type(exc).__name__}: {exc}")
+    return False
+  got = {"tools": set(), "done": False}
+  try:
+    ready = json.loads(await asyncio.wait_for(ws.recv(), 15))
+    if ready.get("gateway") != "mock":
+      report("INFO", "Roaming test call skipped", "the service uses a real gateway; test callers are off there")
+      return False
+    await ws.send(json.dumps({"type": "init", "timezone": "Asia/Kuala_Lumpur", "caller": ROAMING_CALLER}))
+    report("PASS", "Roaming test call connected", f"test caller {ROAMING_CALLER}")
+
+    async def reader():
+      async for raw in ws:
+        message = json.loads(raw)
+        if message.get("type") == "tool_result":
+          got["tools"].add(message.get("name"))
+        elif (message.get("type") == "turn_complete" and message.get("state", "IDLE") == "IDLE"
+              and got.get("asked") and got["tools"] - {"transfer_to_agent"}):
+          got["done"] = True
+    task = asyncio.create_task(reader())
+    try:
+      await asyncio.sleep(5)                                           # the greeting
+      got["asked"] = True
+      await ws.send(json.dumps({"type": "text", "data": ROAMING_QUESTION}))
+      deadline = time.monotonic() + 60                                 # transfer + gateway call + answer
+      while not got["done"] and time.monotonic() < deadline and not task.done():
+        await asyncio.sleep(0.5)
+      await asyncio.sleep(2)
+      await ws.send(json.dumps({"type": "end"}))
+      await asyncio.sleep(1)
+    except ConnectionClosed:
+      report("INFO", "Roaming test call ended by the service", "e.g. the agent called end_session")
+    task.cancel()
+  finally:
+    await ws.close()
+  roaming_tools = got["tools"] - {"transfer_to_agent", "search_knowledge_base", "end_session"}
+  check(bool(roaming_tools), "Roaming agent used the gateway", ", ".join(sorted(roaming_tools)),
+        f"no roaming tool within 60 s (tools: {sorted(got['tools'])}) - the model may have answered from the FAQ; re-run",
+        bad="WARN")
+  return bool(roaming_tools)
+
+
+def check_roaming(gcp, service, since):
+  """Logs and trace of the roaming test call: agent change, gateway spans, privacy."""
+  print("\n3e. Roaming agent (Cloud Logging + Cloud Trace)")
+  base = f'resource.type="cloud_run_revision"\nresource.labels.service_name="{service}"'
+  moved = poll(lambda: gcp.logs(base + '\njsonPayload.message=~"active agent roaming_agent"', since, 5), 120)
+  if not check(bool(moved), "'active agent roaming_agent' log line", detail_bad="not found within 2 min"):
+    return
+  entry = moved[0]
+  sid = (entry.get("jsonPayload") or {}).get("session_id", "")
+  trace_id = entry.get("trace", "").split("/")[-1]
+  check(bool(sid) and not sid.startswith("session_"), "Log line carries the hashed session_id", sid)
+  lines = gcp.logs(base + f'\njsonPayload.session_id="{sid}"', since, 100)
+  check(not any(ROAMING_CALLER_MSISDN in json.dumps(l) for l in lines), "No caller number in the call's log lines (privacy)",
+        f"{len(lines)} lines")
+  check(any(ROAMING_CALLER_MSISDN not in json.dumps(l) and (l.get("jsonPayload") or {}).get("security_event")
+            for l in lines), "Security events linked to the call (session_id)", bad="WARN",
+        detail_bad="no security event with this session_id")
+
+  def fetch():
+    try:
+      spans = gcp.call("GET", f"https://cloudtrace.googleapis.com/v1/projects/{gcp.project}/traces/{trace_id}").get("spans", [])
+      return spans if any(s.get("name") == "agent_gateway.request" for s in spans) else None
+    except RuntimeError:
+      return None
+  spans = poll(fetch, 120)
+  if not check(bool(spans), "Trace has agent_gateway.request spans", trace_id, "not found within 2 min"):
+    return
+  by_name = {}
+  for sp in spans:
+    by_name.setdefault(sp.get("name"), []).append(sp.get("labels", {}))
+  gateway = by_name.get("agent_gateway.request", [])
+  ops = sorted({g.get("agent_gateway.operation", "?") for g in gateway})
+  check(all(g.get("agent_gateway.operation") for g in gateway), "Gateway spans name the operation", ", ".join(ops))
+  check(all(g.get("agent_gateway.next_step") or g.get("agent_gateway.violation_code") for g in gateway),
+        "Gateway spans carry the gateway's answer (next_step / violation_code)")
+  check(any(n.startswith("execute_tool ") and n.split(" ", 1)[1] in ops for n in by_name),
+        "Matching execute_tool span for the roaming tool")
+  turns = by_name.get("model_turn", [])
+  check(any(t.get("gen_ai.agent.name") == "roaming_agent" for t in turns), "model_turn spans by roaming_agent",
+        bad="WARN", detail_bad=f"agents: {sorted({t.get('gen_ai.agent.name') for t in turns})}")
+  call = (by_name.get("voice_session") or [{}])[0]
+  check(call.get("session.id") == sid, "voice_session: session.id matches the logs")
+  check(call.get("voice.last_agent") == "roaming_agent", "voice_session: voice.last_agent = roaming_agent",
+        call.get("voice.last_agent", ""))
+  values = json.dumps([l for ls in by_name.values() for l in ls])
+  check(ROAMING_CALLER_MSISDN not in values, "No caller number in any span (privacy)")
+
+
 # --------------------------------------------------------------------------- 3a. logs
 def check_logs(gcp, service, since):
   print("\n3a. Logs (Cloud Logging)")
@@ -348,7 +458,7 @@ def check_trace(gcp, trace_id, sid, engine_id, version):
 
 
 # --------------------------------------------------------------------------- 3c. metrics
-def check_metrics(gcp):
+def check_metrics(gcp, roaming_ran=False):
   print("\n3c. Metrics (Cloud Monitoring; exported about once a minute)")
   url = (f"https://monitoring.googleapis.com/v3/projects/{gcp.project}/metricDescriptors?filter="
          + quote('metric.type = starts_with("prometheus.googleapis.com/voice")'))
@@ -372,8 +482,11 @@ def check_metrics(gcp):
     check(bool(found), f"Metric {name}", found or "", "never exported (or still within the first minute)")
   for name in OPTIONAL_METRICS:
     found = find(name)
+    # Required once the roaming test call used the gateway (exported about a minute later).
     check(bool(found), f"Metric {name}", found or "",
-          "not exported yet: make one call that uses a roaming tool, then re-run", bad="WARN")
+          "not exported yet (exported about once a minute) - re-run in a minute" if roaming_ran
+          else "not exported yet: make one call that uses a roaming tool, then re-run",
+          bad="FAIL" if roaming_ran else "WARN")
 
   def recent(metric_type):
     # RFC 3339 with "Z": a "+00:00" offset in a URL turns into a space and is rejected.
@@ -435,7 +548,8 @@ def check_history(gcp, service, revision):
 
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  parser.add_argument("--no-call", action="store_true", help="skip the test call (settings and history only)")
+  parser.add_argument("--no-call", action="store_true", help="skip the test calls (settings and history only)")
+  parser.add_argument("--no-roaming", action="store_true", help="skip the second (roaming agent) test call")
   parser.add_argument("--project", help="override GOOGLE_CLOUD_PROJECT from .env")
   args = parser.parse_args()
   # .env wins over the shell, exactly like ./deploy.sh (which sources .env), so
@@ -455,11 +569,15 @@ def main():
     since = datetime.now(timezone.utc) - timedelta(seconds=5)
     base_url = run_env.get("ALLOWED_ORIGINS", "").split(",")[0]
     connected = asyncio.run(make_test_call(base_url))
+    roaming_since = datetime.now(timezone.utc) - timedelta(seconds=5)
+    roaming_ran = asyncio.run(make_roaming_call(base_url)) if connected and not args.no_roaming else False
     sid, trace_id = check_logs(gcp, service, since) if connected else (None, None)
     if sid:
       check_trace(gcp, trace_id, sid, run_env.get("FAQ_SEARCH_ENGINE_ID"), version)
       check_transcript(gcp, run_env.get("GCS_BUCKET"), run_env.get("GCS_LOG_PREFIX", "VoiceAgentLogs"), sid, trace_id)
-    check_metrics(gcp)
+    if roaming_ran:
+      check_roaming(gcp, service, roaming_since)
+    check_metrics(gcp, roaming_ran)
   check_history(gcp, service, revision)
 
   counts = {s: RESULTS.count(s) for s in ("PASS", "FAIL", "WARN", "INFO")}

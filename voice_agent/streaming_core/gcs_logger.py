@@ -27,7 +27,13 @@ class TranscriptLogger:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     prefix = os.getenv("GCS_LOG_PREFIX", "VoiceAgentLogs").strip("/")
     self.bucket = os.getenv("GCS_BUCKET")
-    self.object_name = f"{prefix}/conversation_{safe_id}_{stamp}.json"
+    # The file is named by the call's hashed session_ref when the server passes one: the same ID
+    # as session_id in the logs and session.id on the trace, so a log line ("Transcript saved to
+    # ...") never shows the raw session ID (guardrails LM-07), and anyone holding a log line or a
+    # trace (or scripts/validate_observability.py) finds the file by that ID. The raw ID stays
+    # inside the file (data.session_id) for ADK correlation.
+    file_id = re.sub(r"[^A-Za-z0-9_-]", "", str(metadata.get("session_ref") or ""))[:64] or safe_id
+    self.object_name = f"{prefix}/conversation_{file_id}_{stamp}.json"
     self.data = {
         "session_id": safe_id,
         "session_start": _now(),

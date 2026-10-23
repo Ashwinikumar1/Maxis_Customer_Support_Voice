@@ -56,6 +56,8 @@ error and the server starts without it.
 cd voice_agent && uv run python -m unittest discover -s observability/tests -t .
 ```
 
-45 tests, including the gateway and security-event tracing, and two end-to-end runs of the real `server.py`: a failing call (span marked
+57 tests, including the gateway and security-event tracing, three end-to-end roaming calls through the real
+server (`test_roaming_end_to_end.py`: buy a pass, gateway down, purchase refused; scripted model, everything
+else real), and two end-to-end runs of the real `server.py`: a failing call (span marked
 ERROR, logs carry `session_id` and trace), a cross-site 403, and SIGTERM during an in-progress
 call (transcript saved, root span exported, exit in under 10 s).

@@ -114,7 +114,7 @@ Expected: `39 passed`. What they cover:
 Also run the other suites before merging:
 
 ```bash
-uv run python -m unittest discover -s observability/tests -t .   # observability: 45 tests
+uv run python -m unittest discover -s observability/tests -t .   # observability: 57 tests
 cd .. && SKIP_TERRAFORM=1 security/ci/run_checks.sh             # security: guardrails, policy checks, self-test, evals, jobs
 ```
 
