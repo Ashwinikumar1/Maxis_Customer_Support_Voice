@@ -361,8 +361,16 @@ def check_history(gcp, service, revision):
 def main():
   parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("--no-call", action="store_true", help="skip the test call (settings and history only)")
+  parser.add_argument("--project", help="override GOOGLE_CLOUD_PROJECT from .env")
   args = parser.parse_args()
-  env = {**dotenv_values(os.path.join(os.path.dirname(__file__), "..", ".env")), **os.environ}
+  # .env wins over the shell, exactly like ./deploy.sh (which sources .env), so
+  # a GOOGLE_CLOUD_PROJECT left over in the terminal can't point us elsewhere.
+  env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+  if not os.path.exists(env_file):
+    sys.exit(f"Missing {os.path.normpath(env_file)} - run from voice_agent/ after creating .env")
+  env = {**os.environ, **{k: v for k, v in dotenv_values(env_file).items() if v is not None}}
+  if args.project:
+    env["GOOGLE_CLOUD_PROJECT"] = args.project
   project, region, service = env["GOOGLE_CLOUD_PROJECT"], env["CLOUD_RUN_REGION"], env["CLOUD_RUN_SERVICE"]
   print(f"Validating {service} in {project} / {region}")
   gcp = Gcp(project)
