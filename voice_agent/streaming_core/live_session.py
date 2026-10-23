@@ -344,17 +344,20 @@ class LiveVoiceSession:
   """One live conversation between a client and the ADK agent tree."""
 
   def __init__(self, *, runner, user_id: str, session_id: str, run_config: RunConfig,
-               transcript: TranscriptLogger):
+               transcript: TranscriptLogger, trace_session_id: str | None = None):
     self.runner = runner              # ADK Runner bound to the agent tree + SessionService
     self.user_id = user_id
-    self.session_id = session_id
+    self.session_id = session_id      # ADK's session ID (raw)
+    # The call's ID in telemetry (span session.id, log session_id). The server passes the
+    # hashed session_ref (guardrails LM-07) so logs and traces join on the same value.
+    self.trace_session_id = trace_session_id or session_id
     self.run_config = run_config
     self.transcript = transcript      # collects turns; saved to GCS by the server at the end
     # LiveRequestQueue = the "inbox" for the model. Anything put here is streamed
     # to Gemini Live by run_live(). A NEW queue per conversation (never reuse).
     self.queue = LiveRequestQueue()
     self.tokens = _CallTokenUsage()       # [#12] token totals for this call
-    self.turn = _TurnTracker(session_id, self.tokens)  # OTel: one "model_turn" span per reply
+    self.turn = _TurnTracker(self.trace_session_id, self.tokens)  # OTel: one "model_turn" span per reply
     self.resumption_updates = 0           # Live API session resumption updates seen
     self._tokens_recorded = False         # [#12] the per-call metric is recorded once
 

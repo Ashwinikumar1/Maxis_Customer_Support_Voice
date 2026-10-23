@@ -66,9 +66,49 @@ def build_event(name: str, **fields: Any) -> dict:
   return event
 
 
+def _trace_link(event: dict) -> dict:
+  """Links the event to the call, like every other log line (observability/logs.py).
+
+  - logging.googleapis.com/trace and /spanId: Cloud Logging shows the event under the call's
+    trace, so the SOC can open the whole call from an alert;
+  - session_id: the call's hashed session_ref (streaming_core.utils.current_session_id), the
+    same value as session.id on the call's spans and session_id on its other log lines;
+  - a span event "security_event.<name>" with the same allow-listed fields on the active span
+    (e.g. a refused tool call shows on its execute_tool span), and for policy_denied the span
+    attribute guardrails.refused_reason, so refusals can be filtered in Trace Explorer.
+  Never fails the caller: any problem here just leaves the event unlinked.
+  """
+  try:
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    if ctx.is_valid:
+      project = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+      trace_id = f"{ctx.trace_id:032x}"
+      event["logging.googleapis.com/trace"] = f"projects/{project}/traces/{trace_id}" if project else trace_id
+      event["logging.googleapis.com/spanId"] = f"{ctx.span_id:016x}"
+      event["logging.googleapis.com/trace_sampled"] = ctx.trace_flags.sampled
+    if span.is_recording():
+      attrs = {k: v for k, v in event.items() if k in ALLOWED_FIELDS}
+      span.add_event(f"security_event.{event['security_event']}", attrs)
+      if event["security_event"] == "policy_denied" and "reason" in event:
+        span.set_attribute("guardrails.refused_reason", event["reason"])
+  except Exception:
+    pass
+  try:
+    from streaming_core.utils import current_session_id
+
+    if (session := current_session_id.get()):
+      event["session_id"] = session
+  except Exception:
+    pass
+  return event
+
+
 def security_event(name: str, **fields: Any) -> dict:
   """Writes one security event line and returns it (for tests)."""
-  event = build_event(name, **fields)
+  event = _trace_link(build_event(name, **fields))
   sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
   sys.stdout.flush()
   return event

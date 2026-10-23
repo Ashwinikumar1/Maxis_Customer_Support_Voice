@@ -26,7 +26,9 @@ from . import settings
 
 _ERROR_EVENT_TYPE = "type.googleapis.com/google.devtools.clouderrorreporting.v1beta1.ReportedErrorEvent"
 _SEVERITY = {"WARN": "WARNING", "FATAL": "CRITICAL"}
-_NOISY_LOGGERS = ("websockets",)  # logs "connection rejected (200 OK)" for every static file
+_NOISY_LOGGERS = ("websockets",  # logs "connection rejected (200 OK)" for every static file
+                  "httpx", "httpcore")  # one INFO line per gateway call, with its full URL: the
+                                        # agent_gateway.request span records the call instead
 # ADK logs every Live API session resumption update at INFO, handle included
 # ("Update session resumption handle: new_handle='...'"). Google's Live API docs
 # describe the handle as a resumption token, so it must not reach Cloud Logging.

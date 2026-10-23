@@ -5,7 +5,7 @@ Order matters:
    (they read their settings at import time, as server.py notes).
 2. Logging BEFORE streaming_core is imported, so its basicConfig() is a no-op.
 3. Hooks that wrap module attributes (ADK provider setup, websockets.serve,
-   the FAQ search helper) BEFORE server.py binds or calls them.
+   the FAQ search helper, the gateway client's send) BEFORE server.py binds or calls them.
 4. SIGTERM handler last, in the main thread.
 
 Each hook can be switched off with an OBS_* variable (default on).
@@ -47,6 +47,7 @@ def install() -> None:
       ("OBS_SESSION_SPANS", "adk_hook"),
       ("OBS_WS_SECURITY_LOGS", "ws_hooks"),
       ("OBS_FAQ_TRACING", "faq_tracing"),
+      ("OBS_GATEWAY_TRACING", "gateway_tracing"),
       ("OBS_SIGTERM", "shutdown"),
   ]
   enabled = []

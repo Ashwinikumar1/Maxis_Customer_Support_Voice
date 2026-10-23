@@ -64,6 +64,7 @@ from guardrails import (  # noqa: E402
     RedactingTranscriptLogger, build_plugins, make_session_service, security_event,
     set_verification_level)
 from guardrails.call_limits import SilenceWatch  # noqa: E402
+from guardrails.tool_policy import K_VERIFICATION  # noqa: E402
 from guardrails.events import hash_id  # noqa: E402
 from guardrails.identity import IdentityError, identify, verifier_from_env  # noqa: E402
 from opentelemetry import metrics, trace  # noqa: E402
@@ -388,7 +389,11 @@ async def _handle_client(websocket):
   # because the cleanup block at the end of this function records why the call
   # ended on it ([Observability #9c]).
   call_span = trace.get_current_span()
-  call_span.set_attribute("session.id", session_id)  # match trace <-> transcript
+  # One correlation ID everywhere: session.id on every span of the call (copied to ADK's
+  # spans by observability/spans.py) and session_id on every log line are both the hashed
+  # session_ref, so logs and traces join without raw IDs (guardrails LM-07). The transcript
+  # holds both IDs plus metadata.trace_id, so trace <-> transcript still links.
+  call_span.set_attribute("session.id", session_ref)
   call_span.set_attribute("voice.test_caller", caller_key or "withheld")
   call_span.set_attribute("session.ref", session_ref)
   span_ctx = call_span.get_span_context()
@@ -422,7 +427,8 @@ async def _handle_client(websocket):
       routing_mode=routing_mode(), test_caller=caller_key or "withheld", caller_id=_mask(caller_id),
       gateway="mock" if gateway_client.is_mock() else "remote")
   session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
-                             run_config=default_run_config(VOICE_NAME), transcript=transcript)
+                             run_config=default_run_config(VOICE_NAME), transcript=transcript,
+                             trace_session_id=session_ref)
   logger.info("Session %s started (%s, caller %s)", session_ref, ctx["timezone"], caller_key or "withheld")
 
   # Silence limit (guardrails/call_limits.py): ends the call after
@@ -502,6 +508,9 @@ async def _handle_client(websocket):
     await send({"type": kind, **data})
     if kind == "active_agent":
       last_agent["name"] = data.get("name", "")
+      # The call moved to another agent (e.g. maxis_agent -> roaming_agent): one line per change,
+      # so a call's path through the agents can be read from its logs as well as its trace.
+      logger.info("Session %s: active agent %s", session_ref, last_agent["name"])
     elif kind == "tool_call" and data.get("name") == "end_session":
       last_agent["end_args"] = dict(data.get("args") or {})
     elif kind == "tool_result" and data.get("name") == "end_session" and not outcome:
@@ -514,6 +523,10 @@ async def _handle_client(websocket):
                  "agent": data.get("author", ""),
                  "params": {k: v for k, v in args.items() if k not in ("session_escalated", "reason")}}
       outcome.update(saved)
+      params = outcome.get("params") or {}
+      logger.info("Session %s: end_session by %s (escalated=%s, intent=%s, use_case=%s)", session_ref,
+                  outcome.get("agent") or last_agent["name"], bool(outcome.get("session_escalated")),
+                  params.get("intent", ""), params.get("use_case", ""))
       transcript.add_event("end_session", **outcome)
       await send({"type": "handover", **outcome})
       loop.call_later(END_MAX_WAIT_S, ended.set)
@@ -647,6 +660,11 @@ async def _handle_client(websocket):
     call_span.set_attributes({
         "voice.close_reason": close_reason,
         "voice.call_outcome": result,
+        "voice.last_agent": outcome.get("agent") or last_agent["name"],
+        "voice.handover.escalated": bool(outcome.get("session_escalated")),
+        "voice.handover.intent": params.get("intent", "none"),
+        "voice.handover.use_case": params.get("use_case", ""),
+        "voice.verification_level": int(state.get(K_VERIFICATION, 0) or 0),  # guardrails level for this call
         "voice.dropped.invalid_audio": dropped["invalid_audio"],
         "voice.dropped.invalid_message": dropped["invalid_message"],
         # [#12] e.g. voice.tokens.input, voice.tokens.output, voice.tokens.total,

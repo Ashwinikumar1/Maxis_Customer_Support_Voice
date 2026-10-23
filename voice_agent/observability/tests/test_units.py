@@ -18,7 +18,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
 
-from observability import faq_tracing, logs, spans
+from observability import faq_tracing, gateway_tracing, logs, spans
 
 # One SDK tracer/meter provider for the whole test module (OTel allows setting them once).
 EXPORTER = InMemorySpanExporter()
@@ -202,6 +202,137 @@ class FaqTracingTests(unittest.TestCase):
   def test_wrap_is_idempotent(self):
     traced = faq_tracing.wrap(lambda q: [], "e")
     self.assertIs(faq_tracing.wrap(traced, "e"), traced)
+
+
+class GatewayTracingTests(unittest.TestCase):
+  """The roaming tools' gateway calls get the same coverage as the FAQ search (gap #3)."""
+
+  HEADERS = {"X-Caller-Id": "60100000001", "X-Conversation-Id": "session_x"}
+
+  @staticmethod
+  def _send(response=None, exc=None):
+    async def send(method, path, **kwargs):
+      if exc:
+        raise exc
+      return response
+    return send
+
+  def _call(self, send, method="GET", path="/roaming/passes"):
+    import asyncio
+
+    traced = gateway_tracing.wrap(send)
+    return asyncio.run(traced(method, path, headers=self.HEADERS, params={"destinations": "Tokyo"}, body=None))
+
+  def test_success_span_has_operation_and_next_step(self):
+    import httpx
+
+    EXPORTER.clear()
+    resp = httpx.Response(200, json={"status": "success", "responseData": {"next_step": "recommend_pass"}})
+    self._call(self._send(resp))
+    span = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(span.name, "agent_gateway.request")
+    self.assertEqual(span.attributes["agent_gateway.operation"], "findPasses")
+    self.assertEqual(span.attributes["agent_gateway.next_step"], "recommend_pass")
+    self.assertEqual(span.attributes["http.response.status_code"], 200)
+    self.assertNotEqual(span.status.status_code, StatusCode.ERROR)
+    recorded = json.dumps(dict(span.attributes))
+    self.assertNotIn("60100000001", recorded)  # the caller's number is never recorded
+    self.assertNotIn("Tokyo", recorded)        # nor the arguments
+
+  def test_business_refusal_is_not_an_error(self):
+    import httpx
+
+    EXPORTER.clear()
+    resp = httpx.Response(200, json={"status": "fail", "violations": [
+        {"code": "NOT_A_MAXIS_NUMBER", "action": "general_help_only"}]})
+    self._call(self._send(resp), path="/roaming/lines")
+    span = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(span.attributes["agent_gateway.violation_code"], "NOT_A_MAXIS_NUMBER")
+    self.assertNotEqual(span.status.status_code, StatusCode.ERROR)
+
+  def test_backend_unavailable_and_5xx_are_errors(self):
+    import httpx
+
+    EXPORTER.clear()
+    self._call(self._send(httpx.Response(200, json={"status": "fail", "violations": [
+        {"code": "BACKEND_UNAVAILABLE", "action": "apologise_and_offer_agent"}]})), "POST", "/roaming/purchases")
+    self._call(self._send(httpx.Response(503, text="down")), "POST", "/roaming/switch")
+    unavailable, http_503 = EXPORTER.get_finished_spans()[-2:]
+    self.assertEqual(unavailable.status.status_code, StatusCode.ERROR)
+    self.assertEqual(unavailable.attributes["agent_gateway.operation"], "buyPass")
+    self.assertEqual(http_503.status.status_code, StatusCode.ERROR)
+    self.assertEqual(http_503.attributes["http.response.status_code"], 503)
+
+  def test_network_failure_is_marked_raised_and_measured(self):
+    import httpx
+
+    EXPORTER.clear()
+    with self.assertRaises(httpx.ConnectError):
+      self._call(self._send(exc=httpx.ConnectError("down")))
+    span = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(span.status.status_code, StatusCode.ERROR)
+    self.assertTrue(any(e.name == "exception" for e in span.events))
+    points = _metric_points("voice.gateway.duration")
+    self.assertIn(("findPasses", "ConnectError"),
+                  {(p.attributes.get("operation"), p.attributes.get("outcome")) for p in points})
+
+  def test_tool_logs_failure_once_and_marks_tool_span(self):
+    import asyncio
+    from types import SimpleNamespace
+
+    import httpx
+
+    from voice_assistant import gateway_client, roaming_tools
+
+    original = gateway_client._send
+    EXPORTER.clear()
+    try:
+      gateway_client._send = gateway_tracing.wrap(self._send(exc=httpx.ConnectError("down")))
+      ctx = SimpleNamespace(state={"caller_id": "60100000001"}, session=SimpleNamespace(id="s"))
+      with TRACER.start_as_current_span("execute_tool findPasses"):
+        with self.assertLogs("voice_agent", level="ERROR") as captured:
+          result = asyncio.run(roaming_tools.findPasses("Tokyo", ctx))
+      self.assertEqual(result["violations"][0]["code"], "BACKEND_UNAVAILABLE")  # polite answer kept
+      self.assertEqual(len(captured.records), 1, "each failure is logged exactly once")
+      self.assertIsNotNone(captured.records[0].exc_info)
+      self.assertNotIn("60100000001", captured.output[0])
+      self.assertNotIn("Tokyo", captured.output[0])
+      names = [s.name for s in EXPORTER.get_finished_spans()]
+      self.assertEqual(names[-2:], ["agent_gateway.request", "execute_tool findPasses"])
+    finally:
+      gateway_client._send = original
+
+  def test_wrap_is_idempotent(self):
+    traced = gateway_tracing.wrap(self._send())
+    self.assertIs(gateway_tracing.wrap(traced), traced)
+
+
+class SecurityEventLinkTests(unittest.TestCase):
+  """Security events are linked to the call like every other log line."""
+
+  def test_event_carries_trace_session_and_span_event(self):
+    from contextlib import redirect_stdout
+
+    from guardrails.events import security_event
+    from streaming_core.utils import current_session_id
+
+    EXPORTER.clear()
+    token = current_session_id.set("u_abc")
+    out = io.StringIO()
+    try:
+      with TRACER.start_as_current_span("execute_tool buyPass") as span:
+        with redirect_stdout(out):
+          security_event("policy_denied", tool="buyPass", reason="verification_required", severity="WARNING")
+        trace_hex = f"{span.get_span_context().trace_id:032x}"
+    finally:
+      current_session_id.reset(token)
+    line = json.loads(out.getvalue())
+    self.assertEqual(line["security_event"], "policy_denied")
+    self.assertTrue(line["logging.googleapis.com/trace"].endswith(trace_hex))
+    self.assertEqual(line["session_id"], "u_abc")
+    finished = EXPORTER.get_finished_spans()[-1]
+    self.assertEqual(finished.attributes["guardrails.refused_reason"], "verification_required")
+    self.assertIn("security_event.policy_denied", [e.name for e in finished.events])
 
 
 if __name__ == "__main__":

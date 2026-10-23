@@ -77,6 +77,18 @@ def _fail(code: str, message: str, action: str) -> dict:
           "timeStamp": datetime.now(timezone.utc).isoformat()}
 
 
+async def _send(method: str, path: str, *, headers: dict, params: dict | None,
+                body: dict | None) -> httpx.Response:
+  """One HTTP call to the gateway. Raises on network, DNS, timeout or token errors.
+
+  Kept separate from request() so observability/gateway_tracing.py can wrap it (a CLIENT
+  span with the HTTP status and the gateway's answer, and a latency metric), the same way
+  observability/faq_tracing.py wraps the FAQ tool's _search.
+  """
+  headers = {**headers, **(await _auth_header())}
+  return await _get_client().request(method, path, params=params or None, json=body, headers=headers)
+
+
 async def request(method: str, path: str, *, caller_id: str | None, conversation_id: str | None,
                   params: dict | None = None, body: dict | None = None) -> dict:
   """Calls one gateway operation and returns its JSON envelope (never raises)."""
@@ -88,13 +100,16 @@ async def request(method: str, path: str, *, caller_id: str | None, conversation
   params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
   body = {k: v for k, v in (body or {}).items() if v not in (None, "")} if body is not None else None
   try:
-    headers.update(await _auth_header())
-    resp = await _get_client().request(method, path, params=params or None, json=body, headers=headers)
+    resp = await _send(method, path, headers=headers, params=params, body=body)
   except Exception as e:  # network, DNS, timeout, token
-    logger.warning("Gateway %s %s failed: %s", method, path, type(e).__name__)
+    # [Observability] Logged once, here, with the traceback (like the FAQ tool's except):
+    # the tool turns the failure into a polite answer for the agent, so without this line a
+    # gateway outage would look like a normal call. ERROR also marks the tool's span ERROR
+    # (observability/logs.py). Never logs the caller's number or the arguments.
+    logger.error("Gateway %s %s failed (%s)", method, path, type(e).__name__, exc_info=True)
     return _fail("BACKEND_UNAVAILABLE", "The roaming system didn't answer.", "apologise_and_offer_agent")
   if resp.status_code >= 500 or resp.status_code in (401, 403):
-    logger.warning("Gateway %s %s -> HTTP %s", method, path, resp.status_code)
+    logger.error("Gateway %s %s -> HTTP %s", method, path, resp.status_code)
     return _fail("BACKEND_UNAVAILABLE", "The roaming system returned an error.", "apologise_and_offer_agent")
   try:
     data = resp.json()
@@ -104,4 +119,7 @@ async def request(method: str, path: str, *, caller_id: str | None, conversation
   if resp.status_code >= 400 and data.get("status") != "fail":
     return _fail("INVALID_REQUEST", str(data.get("message") or "The request was not accepted."),
                  "fix_the_request")
+  if data.get("status") == "fail" and ((data.get("violations") or [{}])[0] or {}).get("code") == "BACKEND_UNAVAILABLE":
+    # The gateway answered, but Maxis's systems behind it didn't: also an outage, logged once.
+    logger.error("Gateway %s %s: Maxis backend unavailable", method, path)
   return data

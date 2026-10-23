@@ -218,7 +218,12 @@ class LauncherEndToEnd(unittest.TestCase):
     spans = [json.loads(l) for l in spans_file.read_text().splitlines()]
     sessions = [s for s in spans if s["name"] == "voice_session"]
     self.assertTrue(sessions, "voice_session span exported")
-    self.assertTrue(sessions[0]["attributes"].get("session.id", "").startswith("session_"))
+    # Logs and traces join on one ID: the hashed session_ref (guardrails LM-07), never the raw
+    # "session_..." ID, which stays in ADK and the transcript.
+    span_sid = sessions[0]["attributes"].get("session.id", "")
+    self.assertTrue(span_sid and not span_sid.startswith("session_"), span_sid)
+    self.assertEqual(span_sid, sessions[0]["attributes"].get("session.ref"))
+    self.assertTrue(all(e["session_id"] == span_sid for e in session_logs), "logs and trace share the call ID")
     failed = [e for e in entries if "failed" in e["message"] and e["severity"] == "ERROR"]
     if failed:  # the Live API call failed (no credentials): the trace must say so too
       self.assertEqual(sessions[0]["status"], "ERROR")

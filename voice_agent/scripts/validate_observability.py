@@ -47,7 +47,11 @@ EXPECTED_ROLES = ["roles/aiplatform.user", "roles/discoveryengine.viewer",
                   "roles/monitoring.metricWriter", "roles/logging.logWriter"]
 OLD_ROLES = ["roles/cloudtrace.agent", "roles/telemetry.logsWriter", "roles/telemetry.metricsWriter"]
 METRICS = ["voice.sessions", "voice.sessions.active", "voice.session.duration", "voice.time_to_first_audio",
-           "voice.model_turns", "voice.call.tokens", "voice.faq_search.duration", "voice.ws.rejected"]
+           "voice.model_turns", "voice.call.tokens", "voice.faq_search.duration", "voice.ws.rejected",
+           "voice.calls"]
+# Exported only once a roaming tool has called the agent gateway (not by this script's test call),
+# so a missing one is a warning, not a failure.
+OPTIONAL_METRICS = ["voice.gateway.duration"]
 
 RESULTS = []
 
@@ -354,7 +358,7 @@ def check_metrics(gcp):
   # or turn them into underscores and add a suffix (e.g. _total); longer names are
   # matched first so voice.sessions never claims voice.sessions.active.
   found_types, claimed = {}, set()
-  for name in sorted(METRICS, key=len, reverse=True):
+  for name in sorted(METRICS + OPTIONAL_METRICS, key=len, reverse=True):
     flat = name.replace(".", "_")
     for t in sorted(types):
       seg = t.split("/")[1]
@@ -366,6 +370,10 @@ def check_metrics(gcp):
   for name in METRICS:
     found = find(name)
     check(bool(found), f"Metric {name}", found or "", "never exported (or still within the first minute)")
+  for name in OPTIONAL_METRICS:
+    found = find(name)
+    check(bool(found), f"Metric {name}", found or "",
+          "not exported yet: make one call that uses a roaming tool, then re-run", bad="WARN")
 
   def recent(metric_type):
     # RFC 3339 with "Z": a "+00:00" offset in a URL turns into a space and is rejected.
