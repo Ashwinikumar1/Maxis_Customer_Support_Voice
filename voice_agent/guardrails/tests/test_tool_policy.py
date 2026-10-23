@@ -160,3 +160,21 @@ def test_injection_flag_state_key():
   state = {}
   flag_injection(state, source="heuristic", category="mode_switch")
   assert state[K_INJECTION] is True
+
+
+def test_write_defaults_follow_the_gateway(monkeypatch):
+  """Empty settings: writes on and 3 per call with the mock gateway; off and 1 with a real one."""
+  from guardrails import tool_policy as tp
+
+  monkeypatch.delenv("WRITE_TOOLS_ENABLED", raising=False)
+  monkeypatch.delenv("MAX_WRITES_PER_CALL", raising=False)
+  monkeypatch.setenv("GATEWAY_URL", "mock")
+  assert tp._env_writes_enabled() is True and tp.max_writes_per_call() == 3
+  monkeypatch.setenv("GATEWAY_URL", "https://gateway.example")
+  assert tp._env_writes_enabled() is False and tp.max_writes_per_call() == 1
+  monkeypatch.setenv("WRITE_TOOLS_ENABLED", "true")
+  monkeypatch.setenv("MAX_WRITES_PER_CALL", "2")
+  assert tp._env_writes_enabled() is True and tp.max_writes_per_call() == 2  # explicit values win
+  monkeypatch.setenv("GATEWAY_URL", "mock")
+  monkeypatch.setenv("WRITE_TOOLS_ENABLED", "false")
+  assert tp._env_writes_enabled() is False  # the kill switch still works with the mock

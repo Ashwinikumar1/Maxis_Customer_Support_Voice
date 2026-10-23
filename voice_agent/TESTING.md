@@ -15,16 +15,39 @@ Three levels, fastest first:
 
 ---
 
-## 0. Setup (once)
+## 0. Setup (once): one command
 
 ```bash
-gcloud auth application-default login
-cd voice_agent
-cp .env.example .env      # if you already have a .env, add the new settings below to it
-uv sync
+voice_agent/scripts/dev.sh setup
 ```
 
-New settings in `.env` (defaults are fine for testing):
+This does everything:
+1. Checks `uv` (and `gcloud`).
+2. Creates or updates `.env` with `scripts/setup_env.py`. It adds every setting from `.env.example` that your
+   `.env` is missing, keeps your values exactly as they are, and backs the old file up as `.env.bak.<time>`.
+3. Runs `uv sync`.
+4. Signs you in to Google (`gcloud auth application-default login`) only if you aren't signed in already.
+
+`scripts/dev.sh` also runs everything else in this guide:
+
+| Command | Does |
+|---|---|
+| `scripts/dev.sh test` | All tests that need no cloud access: pytest, observability, security checks (~1 min) |
+| `scripts/dev.sh scenarios [--judge -v ...]` | Section 2 (real model, typed turns) |
+| `scripts/dev.sh run` | Section 3: the server as Cloud Run starts it, http://127.0.0.1:8080 |
+| `scripts/dev.sh mock` | Section 5: standalone mock gateway on :8090 |
+| `scripts/dev.sh deploy` / `validate` | Section 6: deploy, then check traces, logs and metrics in Google Cloud |
+| `scripts/dev.sh all` | setup + test + scenarios |
+
+To change one setting without opening `.env`:
+`python3 scripts/setup_env.py --set ROUTING_MODE=specialist`. To see what's missing without changing
+anything: `python3 scripts/setup_env.py --check`.
+
+**No `.env` changes are needed to test.** Every new setting below has a default that suits testing
+with the mock gateway when it's missing or empty, so an older `.env` works as it is. Set one only
+to try something else (e.g. `ROUTING_MODE=specialist`, or `WRITE_TOOLS_ENABLED=false` to see a refusal).
+
+New settings (all optional):
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -34,9 +57,9 @@ New settings in `.env` (defaults are fine for testing):
 | `MOCK_RESET_ON_CALL` | `true` | Every call starts with the caller's demo account as seeded (repeatable demos). |
 | `MOCK_PASS_HISTORY` | `true` | Mock lists active and past passes. The production gateway today lists **scheduled only** (no history API yet); set `false` to behave like production. |
 | `REDACT_TRANSCRIPTS` | `regex` | `none`, `regex` or `dlp` (Cloud DLP; needs `roles/dlp.user`). With the guardrails' redacting logger in place, `regex` adds nothing and only `dlp` adds a layer. |
-| `WRITE_TOOLS_ENABLED` | `false` | **Set `true` to demo purchases and roaming switches.** It's the security kill switch for tools that change a line; with `false`, `buyPass` and `switchRoaming` are refused (`writes_disabled`) and the agent offers a person. |
+| `WRITE_TOOLS_ENABLED` | empty | Kill switch for tools that change a line. **Empty: on with the mock gateway** (purchases and switches can be demoed, nothing real changes), **off with a real gateway**. Set `false` to test the refusal (`writes_disabled`). |
 | `TEST_CALLER_VERIFICATION_LEVEL` | `2` | Guardrails verification level a test caller gets: `1` = look-ups only (what a real caller ID gives, without OTP), `2` = can buy and switch. Mock gateway only. |
-| `MAX_WRITES_PER_CALL` | `1` | Account changes allowed per call (security baseline for phase 1). With 1, a second purchase or a switch after a purchase in the **same call** is refused (`write_limit`): start a new call, or set `2` or `3` for a demo. A confirmed call that changed nothing (roaming still switching on, a duplicate) doesn't count. |
+| `MAX_WRITES_PER_CALL` | empty | Account changes allowed per call. Empty: 3 with the mock gateway, 1 (phase 1 security baseline) with a real gateway. A confirmed call that changed nothing (roaming still switching on, a duplicate) doesn't count. |
 
 ### Security guardrails (on every call)
 
@@ -81,7 +104,7 @@ Expected: `39 passed`. What they cover:
 Also run the other suites before merging:
 
 ```bash
-uv run python -m unittest discover -s observability/tests -t .   # observability: 38 tests
+uv run python -m unittest discover -s observability/tests -t .   # observability: 45 tests
 cd .. && SKIP_TERRAFORM=1 security/ci/run_checks.sh             # security: guardrails, policy checks, self-test, evals, jobs
 ```
 

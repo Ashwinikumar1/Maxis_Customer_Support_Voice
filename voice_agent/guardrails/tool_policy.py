@@ -89,7 +89,7 @@ class ToolPolicy:
     from the channel), the two writes (buyPass, switchRoaming) need level 2 and a
     confirmation token. None takes a phone number: the caller's line comes from
     session state, and other lines only as a gateway line_ref.
-    MAX_WRITES_PER_CALL overrides the per-call write limit (default 1, phase 1).
+    MAX_WRITES_PER_CALL overrides the per-call write limit (see max_writes_per_call()).
     """
     read = lambda name, *args, level=1, chars=300: ToolRule(  # noqa: E731
         name, args=frozenset(args), min_verification=level, max_arg_chars=chars)
@@ -109,8 +109,7 @@ class ToolPolicy:
         write("buyPass", "pass_id", "destinations", "start_date", "line_ref"),
         write("switchRoaming", "turn", "line_ref", "acknowledged_active_pass"),
     ]
-    return cls(rules={r.name: r for r in rules},
-               max_writes_per_call=int(os.getenv("MAX_WRITES_PER_CALL", "1")))
+    return cls(rules={r.name: r for r in rules}, max_writes_per_call=max_writes_per_call())
 
   def with_rule(self, rule: ToolRule) -> "ToolPolicy":
     return ToolPolicy({**self.rules, rule.name: rule}, self.max_writes_per_call,
@@ -180,8 +179,26 @@ def _consume_confirmation(state, tool: str, args: dict, now: float) -> Optional[
   return None
 
 
+def _mock_gateway() -> bool:
+  """True when the roaming tools talk to the in-process mock (demo data, no real lines)."""
+  return (os.getenv("GATEWAY_URL", "mock").strip() or "mock") == "mock"
+
+
 def _env_writes_enabled() -> bool:
-  return os.getenv("WRITE_TOOLS_ENABLED", "true").lower() == "true"
+  """WRITE_TOOLS_ENABLED when set. Left empty, it follows the gateway: on for the mock
+  (demo data, nothing real can change), off for a real gateway until verification exists."""
+  value = os.getenv("WRITE_TOOLS_ENABLED", "").strip().lower()
+  if not value:
+    return _mock_gateway()
+  return value == "true"
+
+
+def max_writes_per_call() -> int:
+  """MAX_WRITES_PER_CALL when set; left empty, 3 with the mock (demos) and 1 otherwise (phase 1)."""
+  value = os.getenv("MAX_WRITES_PER_CALL", "").strip()
+  if value:
+    return int(value)
+  return 3 if _mock_gateway() else 1
 
 
 def _refuse(reason: str, next_step: str = "offer_agent") -> dict:
