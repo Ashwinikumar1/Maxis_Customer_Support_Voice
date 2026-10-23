@@ -10,6 +10,7 @@ It also remembers each websockets Server it creates, so shutdown.py can close
 open calls cleanly on SIGTERM (see close_servers below).
 """
 
+import inspect
 import logging
 import weakref
 
@@ -42,16 +43,30 @@ def close_servers() -> None:
       pass
 
 
+def _log_rejection(request, response):
+  status = getattr(response, "status_code", None)
+  if status == 403:
+    origin = request.headers.get("Origin") or "<none>"
+    logger.warning("WebSocket rejected: origin %s not allowed (path %s)", origin[:200], request.path[:200])
+    _rejected.add(1, {"http.response.status_code": status})
+  elif status == 401:
+    # The IAP identity check failed (guardrails/identity.py); the reason is in its security event.
+    logger.warning("WebSocket rejected: identity check failed (path %s)", request.path[:200])
+    _rejected.add(1, {"http.response.status_code": status})
+  return response
+
+
 def _wrap_process_request(process_request):
+  """Logs rejections whether server.py's process_request is a plain or an async function
+  (it is async since the IAP identity check, which may fetch Google's keys)."""
 
   def logged(connection, request):
     response = process_request(connection, request)
-    status = getattr(response, "status_code", None)
-    if status == 403:
-      origin = request.headers.get("Origin") or "<none>"
-      logger.warning("WebSocket rejected: origin %s not allowed (path %s)", origin[:200], request.path[:200])
-      _rejected.add(1, {"http.response.status_code": status})
-    return response
+    if inspect.isawaitable(response):
+      async def awaited():
+        return _log_rejection(request, await response)
+      return awaited()
+    return _log_rejection(request, response)
 
   return logged
 

@@ -97,11 +97,18 @@ def _strings(value):
 def redact_transcript(data: dict) -> dict:
   """Redacts the conversation in place (called from a worker thread) and records how."""
   how = mode()
-  data["metadata"]["redaction"] = how
+  # A subclass may already have redacted (guardrails.RedactingTranscriptLogger: "local",
+  # "local+dlp", applied to every turn as it was recorded). Its local layer is stricter
+  # than these patterns (Luhn-checked cards, spoken digits), so the regex pass is skipped
+  # then; only an extra Cloud DLP pass (REDACT_TRANSCRIPTS=dlp) is added on top.
+  prior = data["metadata"].get("redaction")
+  if prior and how != "dlp":
+    return data
+  data["metadata"]["redaction"] = f"{prior}+{how}" if prior else how
   if how == "none":
     return data
   turns = data["conversation"]
-  for i, entry in enumerate(turns):
+  for i, entry in enumerate(turns if not prior else []):
     turns[i] = {k: (v if k in ("speaker", "timestamp", "agent", "event") else _strings(v))
                 for k, v in entry.items()}
   if how == "dlp":
@@ -112,5 +119,5 @@ def redact_transcript(data: dict) -> dict:
           entry["text"] = clean
       except Exception as e:
         logger.error("DLP redaction failed (%s); keeping regex redaction", type(e).__name__)
-        data["metadata"]["redaction"] = "regex (dlp_failed)"
+        data["metadata"]["redaction"] = f"{prior}+regex (dlp_failed)" if prior else "regex (dlp_failed)"
   return data

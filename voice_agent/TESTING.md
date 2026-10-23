@@ -33,7 +33,26 @@ New settings in `.env` (defaults are fine for testing):
 | `ALLOW_TEST_CALLERS` | `true` | Shows the test-caller picker in the browser. |
 | `MOCK_RESET_ON_CALL` | `true` | Every call starts with the caller's demo account as seeded (repeatable demos). |
 | `MOCK_PASS_HISTORY` | `true` | Mock lists active and past passes. The production gateway today lists **scheduled only** (no history API yet); set `false` to behave like production. |
-| `REDACT_TRANSCRIPTS` | `regex` | `none`, `regex` or `dlp` (Cloud DLP; needs `roles/dlp.user`). |
+| `REDACT_TRANSCRIPTS` | `regex` | `none`, `regex` or `dlp` (Cloud DLP; needs `roles/dlp.user`). With the guardrails' redacting logger in place, `regex` adds nothing and only `dlp` adds a layer. |
+| `WRITE_TOOLS_ENABLED` | `false` | **Set `true` to demo purchases and roaming switches.** It's the security kill switch for tools that change a line; with `false`, `buyPass` and `switchRoaming` are refused (`writes_disabled`) and the agent offers a person. |
+| `TEST_CALLER_VERIFICATION_LEVEL` | `2` | Guardrails verification level a test caller gets: `1` = look-ups only (what a real caller ID gives, without OTP), `2` = can buy and switch. Mock gateway only. |
+| `MAX_WRITES_PER_CALL` | `1` | Account changes allowed per call (security baseline for phase 1). With 1, a second purchase or a switch after a purchase in the **same call** is refused (`write_limit`): start a new call, or set `2` or `3` for a demo. A confirmed call that changed nothing (roaming still switching on, a duplicate) doesn't count. |
+
+### Security guardrails (on every call)
+
+The security baseline (`voice_agent/guardrails`, `security/`) sits between the model and every tool:
+- **Tool allow-list.** Every tool has a rule in `guardrails/tool_policy.py`. Look-ups need verification level 1
+  (a caller ID); `buyPass` and `switchRoaming` need level 2 plus a **confirmation token**. The read-back step
+  returns the token, and the confirmed call must send it back with identical arguments.
+- **Refusals** come back as `status: refused` with a reason (`verification_required`, `writes_disabled`,
+  `write_limit`, `confirmation_missing`, `injection_flag`). The agent says it can't do that on this call and
+  offers a person. The Activity panel shows them as `buyPass → offer_agent` and similar.
+- **Injection flag.** Phrases like "ignore your instructions" disable write tools for the rest of the call.
+- **Silence limit and call cap.** The call ends after `SILENCE_TIMEOUT_SECONDS` (120) with nobody speaking, and
+  after `MAX_SESSION_SECONDS` (1800) in all.
+- **No real-caller writes yet.** Production would grant level 2 only after an OTP or a signed Genesys flag,
+  which isn't built. Against the real gateway, a caller ID alone gives level 1: look-ups work, purchases are
+  refused and offered to a person.
 
 ---
 
@@ -43,7 +62,7 @@ New settings in `.env` (defaults are fine for testing):
 uv run pytest -q
 ```
 
-Expected: `36 passed`. What they cover:
+Expected: `39 passed`. What they cover:
 
 - `tests/test_mock_gateway.py`: every `next_step` in `roaming.yaml`. That includes trip rules
   (14-day window, 30-day maximum, 6 h minimum lead for a scheduled pass, start in the past, end before start),
@@ -54,8 +73,17 @@ Expected: `36 passed`. What they cover:
 - `tests/test_tools.py`: the calling number goes **only** in the `X-Caller-Id` header (never a tool argument
   or the URL), gateway errors become `BACKEND_UNAVAILABLE`, `end_session` strips phone numbers, transcript
   redaction, and the agent tree and prompts in both routing modes.
-- `tests/test_agent_flow.py`: a full "buy a pass" call through ADK with a scripted model: transfer to the
-  roaming agent, real tool calls against the mock, `end_session` saved in session state.
+- `tests/test_agent_flow.py`: a full "buy a pass" call through ADK **with the security guardrail plugins**, using
+  a scripted model. It covers the transfer to the roaming agent, real tool calls against the mock, the
+  confirmation token, and `end_session` saved in session state. It also checks that a purchase is refused
+  at verification level 1, with the kill switch off, or with a made-up token.
+
+Also run the other suites before merging:
+
+```bash
+uv run python -m unittest discover -s observability/tests -t .   # observability: 38 tests
+cd .. && SKIP_TERRAFORM=1 security/ci/run_checks.sh             # security: guardrails, policy checks, self-test, evals, jobs
+```
 
 ---
 

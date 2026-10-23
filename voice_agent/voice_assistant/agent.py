@@ -17,11 +17,18 @@ from zoneinfo import ZoneInfo
 
 from google.adk.agents import Agent
 
+from google.adk.apps import App
+
+from guardrails import build_plugins, generate_content_config
+
 from . import prompts
 from .faq_search_tool import search_knowledge_base
 from .roaming_tools import ROAMING_TOOLS
 from .session_tools import end_session
 
+# One exact model per release (AI-01). The default here and VOICE_AGENT_MODEL in .env.example must
+# both be on the approved list in security/policy_checks/policy.json, or the build fails: changing
+# the model is a reviewed change, because a different model can behave differently under attack.
 LIVE_MODEL = os.getenv("VOICE_AGENT_MODEL", "gemini-3.8-live")
 MYT = ZoneInfo("Asia/Kuala_Lumpur")
 
@@ -45,6 +52,7 @@ def create_root_agent(ctx: dict | None = None, model: str | None = None) -> Agen
                    "on or off, and checks roaming status and passes."),
       instruction=prompts.roaming_instruction(today, today_spoken),
       tools=[*ROAMING_TOOLS, end_session],
+      generate_content_config=generate_content_config(),
       disallow_transfer_to_peers=True,
   )
   handoff_agent = Agent(
@@ -55,6 +63,7 @@ def create_root_agent(ctx: dict | None = None, model: str | None = None) -> Agen
                    "Escalates to a person or ends the call."),
       instruction=prompts.handoff_instruction(today, today_spoken),
       tools=[end_session],
+      generate_content_config=generate_content_config(),
       disallow_transfer_to_peers=True,
   )
   return Agent(
@@ -64,7 +73,15 @@ def create_root_agent(ctx: dict | None = None, model: str | None = None) -> Agen
       instruction=prompts.orchestrator_instruction(today, today_spoken, routing_mode()),
       tools=[search_knowledge_base, end_session],
       sub_agents=[roaming_agent, handoff_agent],
+      generate_content_config=generate_content_config(),  # Gemini safety filters (AI-03)
   )
 
 
 root_agent = create_root_agent()
+
+# `adk eval` and `adk web` use a module-level `app` when there is one, and only fall back to the
+# bare `root_agent` otherwise (google/adk/cli/cli_eval.py, get_app_or_root_agent). Exposing the
+# App with the guardrail plugins means the security evaluation tests the agent as it really runs,
+# tool policy, injection flag and Model Armor included. server.py still builds its own App per
+# call (with that call's date in the prompt).
+app = App(name="voice_assistant", root_agent=root_agent, plugins=build_plugins())

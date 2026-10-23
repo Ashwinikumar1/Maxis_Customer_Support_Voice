@@ -14,7 +14,30 @@ from typing import Literal
 
 from google.adk.tools import ToolContext
 
+from guardrails.tool_policy import K_WRITES, issue_confirmation
+
 from . import gateway_client
+
+
+def _with_confirmation(resp: dict, tool_context: ToolContext, tool: str, args: dict,
+                       confirmed: bool, issue_on: set[str], done_on: set[str]) -> dict:
+  """Ties the gateway's two-step flow to the guardrails' confirmation tokens (AP-07).
+
+  - When the gateway asks for the caller's yes (issue_on), code issues a single-use
+    token bound to exactly these arguments; the model must send it back with confirmed
+    true. The tool policy refuses a confirmed call without a valid token.
+  - A confirmed call that changed nothing (roaming still switching on, a duplicate, a
+    date problem) gives its write back, so the per-call write limit counts real changes.
+  - roaming_still_switching_on also issues a fresh token: the caller already agreed, and
+    the retry must carry the same arguments.
+  """
+  data = resp.get("responseData") or {}
+  step = data.get("next_step")
+  if confirmed and step not in done_on:
+    tool_context.state[K_WRITES] = max(0, int(tool_context.state.get(K_WRITES, 0) or 0) - 1)
+  if step in issue_on and resp.get("status") == "success":
+    data["confirmation_token"] = issue_confirmation(tool_context.state, tool, args)
+  return resp
 
 
 def _ids(tool_context: ToolContext) -> dict:
@@ -65,12 +88,14 @@ async def buyPass(  # noqa: N802
     tool_context: ToolContext,
     line_ref: str | None = None,
     confirmed: bool = False,
+    confirmation_token: str | None = None,
 ) -> dict:
   """Buys a roaming pass, in two steps. First call without confirmed: it returns a
   summary to read back (pass, price, start, line, and whether roaming will be
-  switched on first). Only after the caller clearly says yes, call again with
-  confirmed true and the same values. A start date of today buys now; a later date
-  books it ahead. Never say the pass is bought until next_step is purchase_done.
+  switched on first) and a confirmation_token. Only after the caller clearly says
+  yes, call again with confirmed true, the same values and that confirmation_token.
+  A start date of today buys now; a later date books it ahead. Never say the pass
+  is bought until next_step is purchase_done.
 
   Args:
     pass_id: pass_id from findPasses.
@@ -78,11 +103,14 @@ async def buyPass(  # noqa: N802
     start_date: The day the pass starts, YYYY-MM-DD. Today's date buys it now.
     line_ref: The line it's for, from listRoamingLines. Leave out for the caller's own line.
     confirmed: True only after the caller has agreed to the summary.
+    confirmation_token: The confirmation_token from the summary answer, unchanged.
   """
-  return await gateway_client.request(
-      "POST", "/roaming/purchases", **_ids(tool_context),
-      body={"pass_id": pass_id, "destinations": destinations, "start_date": start_date,
-            "line_ref": line_ref, "confirmed": bool(confirmed)})
+  args = {"pass_id": pass_id, "destinations": destinations, "start_date": start_date, "line_ref": line_ref}
+  resp = await gateway_client.request(
+      "POST", "/roaming/purchases", **_ids(tool_context), body={**args, "confirmed": bool(confirmed)})
+  return _with_confirmation(resp, tool_context, "buyPass", args, bool(confirmed),
+                            issue_on={"confirm_purchase", "roaming_still_switching_on"},
+                            done_on={"purchase_done"})
 
 
 async def listMyPasses(  # noqa: N802
@@ -126,10 +154,12 @@ async def switchRoaming(  # noqa: N802
     line_ref: str | None = None,
     confirmed: bool = False,
     acknowledged_active_pass: bool = False,
+    confirmation_token: str | None = None,
 ) -> dict:
   """Switches international roaming on or off, in two steps like buyPass: without
-  confirmed it returns what will happen; after the caller says yes to that exact
-  action, call again with confirmed true. Switching off while a pass is active or
+  confirmed it returns what will happen and a confirmation_token; after the caller
+  says yes to that exact action, call again with confirmed true, the same values and
+  that confirmation_token. Switching off while a pass is active or
   scheduled first returns a warning; only continue if the caller still wants it
   (acknowledged_active_pass true). A change takes about 5 minutes.
 
@@ -139,11 +169,13 @@ async def switchRoaming(  # noqa: N802
     confirmed: True only after the caller has agreed to this exact action.
     acknowledged_active_pass: True when the caller heard the warning about their
       passes and still wants roaming off.
+    confirmation_token: The confirmation_token from the answer that asked for the yes, unchanged.
   """
-  return await gateway_client.request(
-      "POST", "/roaming/switch", **_ids(tool_context),
-      body={"turn": turn, "line_ref": line_ref, "confirmed": bool(confirmed),
-            "acknowledged_active_pass": bool(acknowledged_active_pass)})
+  args = {"turn": turn, "line_ref": line_ref, "acknowledged_active_pass": bool(acknowledged_active_pass)}
+  resp = await gateway_client.request(
+      "POST", "/roaming/switch", **_ids(tool_context), body={**args, "confirmed": bool(confirmed)})
+  return _with_confirmation(resp, tool_context, "switchRoaming", args, bool(confirmed),
+                            issue_on={"confirm_switch"}, done_on={"switch_requested"})
 
 
 async def sendWhatsAppLink(kind: Literal["manage_passes", "wrong_pass", "insurance"], tool_context: ToolContext) -> dict:  # noqa: N802

@@ -19,7 +19,7 @@ How the pieces fit:
 import time
 
 from google.adk.agents import LiveRequestQueue
-from google.adk.agents.run_config import RunConfig, StreamingMode
+from google.adk.agents.run_config import RunConfig
 from google.genai import types
 from opentelemetry import metrics, trace
 
@@ -27,6 +27,14 @@ from .gcs_logger import TranscriptLogger
 from .utils import SEND_SAMPLE_RATE, logger
 
 MAX_TEXT_LEN = 2000  # cap typed messages so a client can't flood the model
+
+# turn_complete_reason values (google.genai.types.TurnCompleteReason) that mean a safety or
+# policy filter stopped the turn, as listed in the Live API reference.
+_SAFETY_REASONS = frozenset({
+    "RESPONSE_REJECTED", "PROHIBITED_INPUT_CONTENT", "INPUT_OTHER", "BLOCKLIST",
+    "GENERATED_CONTENT_SAFETY", "GENERATED_AUDIO_SAFETY", "GENERATED_CONTENT_PROHIBITED",
+    "GENERATED_CONTENT_BLOCKLIST", "GENERATED_OTHER",
+})
 
 # ADK's live mode only emits invoke_agent / execute_tool spans, not one per model
 # reply, so we add a "model_turn" span and a time-to-first-audio metric here.
@@ -51,7 +59,8 @@ _turns = _meter.create_counter("voice.model_turns", description="Model turns by 
 def default_run_config(voice_name: str) -> RunConfig:
   """Live API settings for a voice conversation.
 
-  - streaming_mode=BIDI            : full-duplex streaming (talk and listen at once)
+  - (no streaming_mode)            : run_live() is always full-duplex; ADK's docs say it
+                                     never reads streaming_mode, so it is not set here
   - response_modalities=[AUDIO]    : the model answers with speech
   - speech_config                  : which prebuilt voice speaks (e.g. "Kore")
   - input/output_audio_transcription: also return text of what the user said and
@@ -59,10 +68,12 @@ def default_run_config(voice_name: str) -> RunConfig:
   - session_resumption             : ADK transparently reconnects when Gemini closes
                                      the socket (~10 min limit) without losing context
   - context_window_compression     : sliding window so long calls don't hit the
-                                     context limit
+                                     context limit. Without it, Vertex limits audio-only
+                                     sessions to 15 minutes. Thresholds follow ADK's
+                                     guidance for a 128K window: start at ~78% (100K
+                                     tokens), compress down to ~62% (80K)
   """
   return RunConfig(
-      streaming_mode=StreamingMode.BIDI,
       response_modalities=[types.Modality.AUDIO],
       speech_config=types.SpeechConfig(
           voice_config=types.VoiceConfig(
@@ -73,7 +84,8 @@ def default_run_config(voice_name: str) -> RunConfig:
       output_audio_transcription=types.AudioTranscriptionConfig(),
       session_resumption=types.SessionResumptionConfig(),
       context_window_compression=types.ContextWindowCompressionConfig(
-          sliding_window=types.SlidingWindow()
+          trigger_tokens=100_000,
+          sliding_window=types.SlidingWindow(target_tokens=80_000),
       ),
   )
 
@@ -505,6 +517,15 @@ class LiveVoiceSession:
     # follow, e.g. after a tool) or IDLE (done). Older models send no status,
     # so we treat a missing status as IDLE.
     if event.turn_complete:
+      # Gemini's own content filters (guardrails/safety.py) end a blocked turn with a
+      # turn_complete_reason. Log it as a security event so the SOC sees blocked content,
+      # without the content itself.
+      reason = getattr(event, "turn_complete_reason", None)
+      if reason is not None and reason.name in _SAFETY_REASONS:
+        # Imported here, not at the top: guardrails imports streaming_core (for the transcript
+        # logger), so a module-level import would be circular.
+        from guardrails.events import security_event
+        security_event("safety_block", reason=reason.name, severity="WARNING")
       status = event.interaction_status
       state = status.value if status else "IDLE"
       turn.end(state.lower())
