@@ -12,11 +12,12 @@ On disconnect: TranscriptLogger.save() ─▶ gs://$GCS_BUCKET/$GCS_LOG_PREFIX/c
 
 ## Run locally
 ```bash
-gcloud auth application-default login     # when credentials expire
-cp .env.example .env                      # first time only, then edit
-uv sync
-uv run python server.py                   # http://127.0.0.1:8080 → "Start talking"
+scripts/dev.sh             # first time: .env, packages, Google sign-in, all offline tests, then the server
+scripts/dev.sh run         # afterwards: just the server → http://127.0.0.1:8080 → "Start talking"
 ```
+`scripts/dev.sh help` lists every command (tests, model scenarios, mock gateway, deploy, validate).
+The server starts through the observability launcher (`uv run python -m observability`), as on
+Cloud Run; `uv run python server.py` still works but without the logging and tracing hooks.
 Try: *"What roaming passes do you have?"*, *"How do I turn on roaming?"*,
 *"Macam mana nak aktifkan roaming?"*
 
@@ -27,8 +28,10 @@ Pick a **Test caller** in the header before you start (demo accounts in the mock
 Full test guide: [`TESTING.md`](TESTING.md). Unit tests: `uv run pytest -q`.
 
 ## Configuration (`.env`)
-Every setting is documented in [`.env.example`](.env.example). Both the local
-server and `deploy.sh` read the same file.
+Every setting is documented in [`.env.example`](.env.example) (a comment above each one: what it
+does, allowed values, default when empty). Both the local server and `deploy.sh` read the same file.
+`scripts/setup_env.py` keeps your `.env` in step with it (adds what's missing, keeps your values;
+`--rebuild` for the full layout with comments, `--check`, `--set KEY=VALUE`).
 
 | Setting | Purpose |
 |---|---|
