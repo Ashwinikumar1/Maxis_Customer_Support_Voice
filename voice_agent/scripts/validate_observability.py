@@ -192,6 +192,8 @@ async def make_test_call(base_url):
         got["types"].add(kind)
         if kind == "audio" and got.get("asked"):
           got["audio_after_question"] = True
+        elif kind == "turn_complete" and got["audio_after_question"]:
+          got["answer_done"] = True
     task = asyncio.create_task(reader())
     await asyncio.sleep(6.5)                                          # no init -> init-timeout log
     await ws.send("this is not json")                                 # -> invalid_message
@@ -202,7 +204,13 @@ async def make_test_call(base_url):
     deadline = time.monotonic() + 30
     while not got["audio_after_question"] and time.monotonic() < deadline and not task.done():
       await asyncio.sleep(0.5)
-    await asyncio.sleep(4)                                            # let the answer finish
+    # Wait for the answer to FINISH (turn_complete) before hanging up: Gemini
+    # sends its token report at the end of a turn, so hanging up mid-answer
+    # leaves the call with tokens=n/a (seen on the first real run).
+    deadline = time.monotonic() + 45
+    while not got.get("answer_done") and time.monotonic() < deadline and not task.done():
+      await asyncio.sleep(0.5)
+    await asyncio.sleep(2)                                            # let the usage report arrive
     await ws.send(json.dumps({"type": "end"}))
     await asyncio.sleep(1)
     task.cancel()
@@ -210,6 +218,8 @@ async def make_test_call(base_url):
     await ws.close()
   check(got["audio_after_question"], "Agent answered the typed question with audio",
         detail_bad=f"no answer audio within 30 s (received: {sorted(t for t in got['types'] if t)})")
+  check(bool(got.get("answer_done")), "Answer finished before hanging up (turn_complete)", bad="WARN",
+        detail_bad="no turn_complete within 45 s - token checks below may show n/a")
   return True
 
 
@@ -348,16 +358,23 @@ def check_metrics(gcp):
     check(bool(found), f"Metric {name}", found or "", "never exported (or still within the first minute)")
 
   def recent(metric_type):
+    # RFC 3339 with "Z": a "+00:00" offset in a URL turns into a space and is rejected.
+    fmt = lambda t: t.strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
     end = datetime.now(timezone.utc)
     q = (f"https://monitoring.googleapis.com/v3/projects/{gcp.project}/timeSeries?filter="
-         + quote(f'metric.type = "{metric_type}"') + f"&interval.startTime={(end - timedelta(minutes=15)).isoformat()}"
-         + f"&interval.endTime={end.isoformat()}&view=HEADERS")
-    return gcp.call("GET", q).get("timeSeries")
+         + quote(f'metric.type = "{metric_type}"') + f"&interval.startTime={fmt(end - timedelta(minutes=15))}"
+         + f"&interval.endTime={fmt(end)}&view=HEADERS")
+    try:
+      return gcp.call("GET", q).get("timeSeries")
+    except RuntimeError as exc:
+      errors[metric_type] = str(exc)[:160]
+      return None
+  errors = {}
   for name in ("voice.sessions", "voice.ws.rejected"):
     metric_type = find(name)
     if metric_type:
       check(bool(poll(lambda: recent(metric_type), 150, 15)), f"{name}: data from the test call (last 15 min)",
-            detail_bad="no recent points yet - re-run in a few minutes", bad="WARN")
+            detail_bad=errors.get(metric_type) or "no recent points yet - re-run in a few minutes", bad="WARN")
 
 
 # --------------------------------------------------------------------------- 3d. transcript
