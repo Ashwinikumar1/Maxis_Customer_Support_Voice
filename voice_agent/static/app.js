@@ -123,6 +123,12 @@
       case "error":
         addActivity("error", msg.message);
         break;
+      case "call_outcome":
+        // On telephony this hands the call to a person or hangs up; here we just show it.
+        addActivity("transfer", msg.action === "handoff"
+          ? "Handoff to a person: " + (msg.reason || "")
+          : "Call ended: " + (msg.reason || ""));
+        break;
       // "ready", "pong": no-op
     }
   }
@@ -173,7 +179,11 @@
 
     ws.onopen = () => {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      ws.send(JSON.stringify({ type: "init", timezone }));
+      const msisdnSelect = document.getElementById("msisdnSelect");
+      // Demo only: the server accepts this only if it's in its DEMO_MSISDNS allow-list.
+      ws.send(JSON.stringify({ type: "init", timezone, msisdn: msisdnSelect.value }));
+      msisdnSelect.disabled = true;
+      ws.addEventListener("close", () => { msisdnSelect.disabled = false; });
       setConnected(true);
       setStatus("Listening", "on");
       agentPill.textContent = "voice_assistant";

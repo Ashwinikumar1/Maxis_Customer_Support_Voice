@@ -38,12 +38,17 @@ _ttfa = _meter.create_histogram(
 _turns = _meter.create_counter("voice.model_turns", description="Model turns by outcome")
 
 
-def default_run_config(voice_name: str) -> RunConfig:
+def default_run_config(voice_name: str, language_code: str | None = None) -> RunConfig:
   """Live API settings for a voice conversation.
 
   - streaming_mode=BIDI            : full-duplex streaming (talk and listen at once)
   - response_modalities=[AUDIO]    : the model answers with speech
-  - speech_config                  : which prebuilt voice speaks (e.g. "Kore")
+  - speech_config                  : which prebuilt voice speaks (e.g. "Kore") and,
+                                     optionally, the BCP-47 language_code of the
+                                     speech (e.g. "en-US", "ms-MY"). None/empty =
+                                     model auto-detects. Native-audio models may
+                                     treat it as a hint only; the system prompt
+                                     remains the strongest language control.
   - input/output_audio_transcription: also return text of what the user said and
                                      what the model said (for UI + transcript log)
   - session_resumption             : ADK transparently reconnects when Gemini closes
@@ -57,7 +62,8 @@ def default_run_config(voice_name: str) -> RunConfig:
       speech_config=types.SpeechConfig(
           voice_config=types.VoiceConfig(
               prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
-          )
+          ),
+          language_code=language_code or None,
       ),
       input_audio_transcription=types.AudioTranscriptionConfig(),
       output_audio_transcription=types.AudioTranscriptionConfig(),
