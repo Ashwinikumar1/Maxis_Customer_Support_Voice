@@ -11,8 +11,10 @@ WORKDIR /app
 RUN pip install --no-cache-dir uv
 
 # Dependencies first (cached layer): only changes when pyproject/uv.lock change.
+# Export locked versions + hashes rather than `uv sync --frozen` directly so builds
+# succeed in Cloud Build even if uv.lock was generated against a corp mirror.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv venv && uv export --frozen --no-dev --no-emit-project | uv pip install --no-cache -r -
 
 # App code + UI.
 COPY streaming_core ./streaming_core

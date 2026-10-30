@@ -38,7 +38,6 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 os.environ.setdefault("SSL_CERT_FILE", certifi.where())  # macOS CA bundle for Live API
 
-from google.adk.runners import Runner  # noqa: E402
 from google.adk.sessions import InMemorySessionService  # noqa: E402
 from websockets.asyncio.server import serve  # noqa: E402
 from websockets.datastructures import Headers  # noqa: E402
@@ -46,8 +45,9 @@ from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.http11 import Response  # noqa: E402
 
 from streaming_core import (  # noqa: E402
-    LiveVoiceSession, TranscriptLogger, default_run_config, get_datetime_info, logger)
+    Call, CallInfo, default_run_config, logger)
 from voice_assistant.agent import create_root_agent  # noqa: E402
+from voice_assistant.gateway.client import MSISDN_RE  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 
 
@@ -89,6 +89,8 @@ APP_NAME = "voice_assistant"           # ADK app name; scopes sessions in the Se
 HOST = os.getenv("HOST", "127.0.0.1")  # loopback for local dev; 0.0.0.0 only inside a container
 PORT = int(os.getenv("PORT", "8080"))
 VOICE_NAME = os.getenv("VOICE_NAME", "Kore")  # Gemini prebuilt voice
+# BCP-47 speech language for the Live API (e.g. "en-US", "ms-MY"); empty = auto-detect.
+LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "").strip() or None
 # Browser pages allowed to open the WebSocket (defence against cross-site WS hijacking).
 ALLOWED_ORIGINS = {
     o.strip() for o in os.getenv(
@@ -96,6 +98,14 @@ ALLOWED_ORIGINS = {
 }
 INIT_TIMEOUT_S = 5.0        # how long to wait for the client's {"type":"init"} message
 MAX_B64_LEN = 512 * 1024    # reject oversized audio frames (DoS protection)
+END_CALL_GRACE_S = 5.0      # after endCall/handoff: time for the goodbye to play, then hang up
+# MSISDN = the caller's number; it is the ADK user_id and is sent to every gateway call.
+# Browser channel has no real caller, so it uses demo numbers. The first is the default;
+# the UI may pick another, but only from this allow-list (never a free-form number).
+# TODO(security): on telephony (Genesys), take the MSISDN from the verified ANI in the
+# call metadata and ignore anything the client sends.
+DEMO_MSISDNS = [m.strip() for m in os.getenv("DEMO_MSISDNS", "60123000005,60123000001").split(",")
+                if MSISDN_RE.fullmatch(m.strip())]
 
 # ADK SessionService stores conversation history/state per session.
 # Created ONCE and shared by all connections (per ADK custom-server guidance).
@@ -164,43 +174,49 @@ async def handle_client(websocket):
 
 
 async def _handle_client(websocket):
-  client_id = uuid.uuid4().hex  # random, unguessable id for this connection
+  """Browser channel adapter: browser JSON protocol <-> channel-agnostic Call.
+
+  A Genesys Audio Connector adapter has the same shape (see README "Genesys"):
+  its handshake gives MSISDN (participant ANI) + conversationId, its audio is
+  PCMU 8 kHz (streaming_core/audio.py converts), and it maps "call_outcome"
+  to a "disconnect" message.
+  """
   send = lambda payload: websocket.send(json.dumps(payload))  # noqa: E731
   await send({"type": "ready"})
 
-  # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone.
+  # --- 4a. Handshake: wait briefly for {"type":"init"} with the user's timezone
+  # (and, for local demos only, which demo MSISDN to use).
   # The timezone drives the greeting and the date/time injected into the prompt.
   # If the client never sends it, fall back to DEFAULT_TIMEZONE after 5 s.
-  timezone = None
+  timezone, requested_msisdn = None, None
   try:
     async with asyncio.timeout(INIT_TIMEOUT_S):
       while True:
         msg = _parse(await websocket.recv())
         if msg.get("type") == "init":
           timezone = str(msg.get("timezone") or "")[:64] or None
+          requested_msisdn = msg.get("msisdn")
           break
   except TimeoutError:
     pass
-  ctx = get_datetime_info(timezone)  # {"timezone","date","time","greeting"}
+  except ConnectionClosed:
+    return  # client left before the call started: nothing to clean up
 
-  # --- 4b. Build the per-conversation ADK objects.
-  #   session_service.create_session -> fresh ADK session (history + state=ctx)
-  #   Runner                         -> executes the agent tree for this session
-  #   create_root_agent(ctx)         -> new agent tree with today's date/greeting
-  #   TranscriptLogger               -> collects turns, uploaded to GCS at the end
-  #   LiveVoiceSession               -> the bidi loop between client and Gemini Live
-  # TODO(security): no auth yet - derive user_id from a verified identity in prod.
-  user_id, session_id = f"user_{client_id}", f"session_{client_id}"
-  trace.get_current_span().set_attribute("session.id", session_id)  # match trace <-> transcript
-  await session_service.create_session(app_name=APP_NAME, user_id=user_id, session_id=session_id, state=ctx)
-  runner = Runner(app_name=APP_NAME, agent=create_root_agent(ctx), session_service=session_service)
-  transcript = TranscriptLogger(session_id, channel="browser", timezone=ctx["timezone"])
-  session = LiveVoiceSession(runner=runner, user_id=user_id, session_id=session_id,
-                             run_config=default_run_config(VOICE_NAME), transcript=transcript)
-  logger.info("Session %s started (%s)", session_id, ctx["timezone"])
+  # --- 4b. Start the call. CallInfo is all a channel must provide:
+  #   MSISDN          -> ADK user_id, and X-Caller-Id on every gateway call
+  #   conversation_id -> ADK session_id, and X-Conversation-Id on every gateway call
+  # The browser has no telephony ids, so it uses a demo MSISDN and a random id.
+  info = CallInfo(msisdn=_resolve_msisdn(requested_msisdn), conversation_id=uuid.uuid4().hex,
+                  channel="browser", timezone=timezone)
+  trace.get_current_span().set_attribute("session.id", info.conversation_id)  # trace <-> transcript
+  call = await Call.start(info, session_service=session_service, app_name=APP_NAME,
+                          agent_factory=create_root_agent,
+                          run_config=default_run_config(VOICE_NAME, LANGUAGE_CODE))
+  logger.info("Session %s started (%s, %s, msisdn ...%s)", info.conversation_id, info.channel,
+              call.ctx["timezone"], info.msisdn[-4:])
 
   # --- 4c. UPSTREAM task: browser -> Gemini.
-  # Reads WebSocket messages and pushes them into the session's LiveRequestQueue:
+  # Reads WebSocket messages and pushes them into the call:
   # mic audio chunks (base64 PCM16 16 kHz) and typed text. Returns on "end" or
   # when the browser disconnects (the async-for loop simply finishes).
   async def upstream():
@@ -208,19 +224,20 @@ async def _handle_client(websocket):
       msg = _parse(raw)
       kind = msg.get("type")
       if kind == "audio":
-        session.send_audio(_b64(msg.get("data")))
+        call.send_audio(_b64(msg.get("data")))
       elif kind == "text":
-        session.send_text(str(msg.get("data", "")))
+        call.send_text(str(msg.get("data", "")))
       elif kind == "ping":
         await send({"type": "pong"})
       elif kind == "end":
         return
 
   # --- 4d. DOWNSTREAM callback: Gemini -> browser.
-  # LiveVoiceSession calls emit(type, **data) for everything the model does.
+  # The call emits emit(type, **data) for everything the model does.
   # Here we only translate to the browser's JSON protocol: audio bytes are
-  # base64-encoded, every other event is forwarded as-is. A telephony channel
-  # (e.g. Genesys) would provide its own emit() with audio format conversion.
+  # base64-encoded, every other event is forwarded as-is, including
+  # "call_outcome" (handoff / end), which the UI shows. A telephony channel
+  # would provide its own emit() with audio format conversion.
   async def emit(kind, **data):
     if kind == "audio":
       await send({"type": "audio", "data": base64.b64encode(data["data"]).decode()})
@@ -230,8 +247,14 @@ async def _handle_client(websocket):
   # --- 4e. Run upstream and downstream CONCURRENTLY.
   # Both directions must be live at the same time so the user can interrupt
   # (barge in) while the model is speaking. When either side finishes
-  # (browser disconnects, "end", or a Live API error) we tear everything down.
-  tasks = [asyncio.create_task(upstream()), asyncio.create_task(session.run(emit))]
+  # (browser disconnects, "end", a Live API error, or the call ended via
+  # endCall/handoff) we tear everything down.
+  async def hang_up_when_ended():
+    await call.ended.wait()
+    await asyncio.sleep(END_CALL_GRACE_S)  # let the goodbye finish playing in the browser
+
+  tasks = [asyncio.create_task(upstream()), asyncio.create_task(call.run(emit)),
+           asyncio.create_task(hang_up_when_ended())]
   try:
     done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in done:
@@ -240,7 +263,7 @@ async def _handle_client(websocket):
         raise exc
   except Exception:
     # Log full details server-side; send only a generic message to the client.
-    logger.exception("Session %s failed", session_id)
+    logger.exception("Session %s failed", info.conversation_id)
     try:
       await send({"type": "error", "message": "The voice session ended unexpectedly."})
     except ConnectionClosed:
@@ -250,10 +273,10 @@ async def _handle_client(websocket):
     # upload the transcript ONCE to GCS, then close the browser socket.
     for task in tasks:
       task.cancel()
-    session.close()
-    await transcript.save()  # dump once per session
+    await call.finish()  # closes Live + saves the transcript once
     await websocket.close()
-    logger.info("Session %s closed", session_id)
+    logger.info("Session %s closed (outcome: %s)", info.conversation_id,
+                (call.outcome or {}).get("action", "none"))
 
 
 # =============================================================================
@@ -278,6 +301,13 @@ def _b64(raw) -> bytes:
     return base64.b64decode(raw, validate=True)
   except (binascii.Error, ValueError):
     return b""
+
+
+def _resolve_msisdn(requested) -> str:
+  """The call's MSISDN: an allow-listed demo number the client asked for, else the default."""
+  if not DEMO_MSISDNS:
+    raise RuntimeError("DEMO_MSISDNS has no valid MSISDN (digits only, 8-15 long)")
+  return requested if requested in DEMO_MSISDNS else DEMO_MSISDNS[0]
 
 
 # =============================================================================

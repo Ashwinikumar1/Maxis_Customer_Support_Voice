@@ -29,9 +29,11 @@ server and `deploy.sh` read the same file.
 | Setting | Purpose |
 |---|---|
 | `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` | Vertex AI project and region |
-| `VOICE_AGENT_MODEL`, `VOICE_NAME` | Gemini Live model and prebuilt voice |
+| `VOICE_AGENT_MODEL`, `VOICE_NAME`, `LANGUAGE_CODE` | Gemini Live model, prebuilt voice, speech language (empty = auto) |
 | `DEFAULT_TIMEZONE` | Used for the date in the prompt when the client sends none |
 | `FAQ_SEARCH_ENGINE_ID` | Vertex AI Search app with the Maxis FAQ |
+| `GATEWAY_URL`, `GATEWAY_API_KEY`, `GATEWAY_TIMEOUT_S` | Maxis API gateway; empty URL = built-in mock APIs (dummy data) |
+| `DEMO_MSISDNS` | Allowed demo callers for the browser (first is default); MSISDN = ADK user id + `X-Caller-Id` |
 | `GCS_BUCKET`, `GCS_LOG_PREFIX` | Transcript destination (empty bucket = `./transcripts/`) |
 | `OTEL_TO_CLOUD`, `OTEL_SERVICE_NAME`, `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` | OpenTelemetry export |
 | `HOST`, `PORT`, `ALLOWED_ORIGINS` | Local server and allowed browser origins for `/ws` |
@@ -57,12 +59,28 @@ Monitoring and ADK GenAI logs to Cloud Logging via the Telemetry API.
 - Metrics: `voice.time_to_first_audio` (histogram), `voice.model_turns` (counter), plus ADK GenAI metrics.
 - Caller speech stays out of spans unless `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=true`.
 
-## Next: Genesys Cloud telephony
-`LiveVoiceSession` doesn't depend on the browser. A telephony endpoint only needs to:
-1. accept the Genesys Audio Connector WebSocket (`open` → `opened`),
-2. convert caller PCMU 8 kHz → PCM16 16 kHz → `session.send_audio()`,
-3. in its `emit`, convert `audio` PCM16 24 kHz → PCMU 8 kHz, and send a barge-in on `interrupted`,
-4. reuse the same agent, `TranscriptLogger` and Vertex AI config.
+## Genesys Cloud telephony (Audio Connector)
+The call logic is channel-agnostic: [`streaming_core/call.py`](streaming_core/call.py)
+(`Call` + `CallInfo`) owns the ADK session, agent tree, transcript and call outcome.
+A channel adapter only translates its protocol. The browser adapter
+(`_handle_client` in `server.py`) is the template; a Genesys adapter
+(e.g. `/genesys` on the same server, or the separate `ps-genesys-adapter`) maps:
+
+| Genesys Audio Connector | This server |
+|---|---|
+| `open.parameters.participant.ani` (digits only) | `CallInfo.msisdn`: ADK `user_id`, `X-Caller-Id` on every gateway call |
+| `open.parameters.conversationId` | `CallInfo.conversation_id`: ADK `session_id`, `X-Conversation-Id` |
+| `open.parameters.inputVariables` | `CallInfo.channel_vars` (session state `channel_vars`) |
+| caller audio, PCMU 8 kHz | `ulaw_to_pcm16` → `resample_pcm16(.., 8000, 16000)` → `call.send_audio()` |
+| bot audio | `emit("audio")` PCM16 24 kHz → `resample_pcm16(.., 24000, 8000)` → `pcm16_to_ulaw` |
+| barge-in | `emit("interrupted")` → stop playback / barge-in event |
+| `disconnect` + `outputVariables` | `emit("call_outcome", action=handoff or end, ...)`: escalation params become outputVariables so the Architect flow routes to a queue |
+| `ping` / `close` | answer `pong` / `closed`, then `await call.finish()` |
+
+Audio helpers are in [`streaming_core/audio.py`](streaming_core/audio.py) (pure
+Python; `audioop` no longer exists in Python 3.13+).
+`TODO(security)`: the Genesys endpoint must verify the Audio Connector API key and
+request signature before accepting a call, and only then trust the ANI.
 
 ## Production notes
 - `TODO(security)`: there is no auth on `/ws` yet (only an Origin check). Derive `user_id`

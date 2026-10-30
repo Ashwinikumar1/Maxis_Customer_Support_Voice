@@ -56,3 +56,6 @@ main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; paddin
 .tag.transfer, .tag.agent { background: #1f2d4d; color: #8fb3ff; }
 .tag.error { background: #4a1d1f; color: #ff9592; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.sr-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+select { background: var(--panel, #1b1f27); color: inherit; border: 1px solid #333a46; border-radius: 6px; padding: 6px 8px; font: inherit; }
+select:disabled { opacity: .6; }

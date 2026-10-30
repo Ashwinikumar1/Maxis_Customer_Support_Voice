@@ -29,6 +29,13 @@ gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 
 
 # A new service account takes a few seconds to propagate in IAM: retry grants.
 retry() { for i in 1 2 3 4 5 6; do "$@" >/dev/null 2>&1 && return 0; sleep 10; done; "$@"; }
+
+# Cloud Build uses the default Compute Engine service account for `--source .` builds;
+# in projects where automatic Editor grants are disabled, it needs Cloud Build permissions.
+COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$COMPUTE_SA" \
+  --role roles/cloudbuild.builds.builder --condition None --quiet
+
 for role in roles/aiplatform.user roles/discoveryengine.viewer roles/serviceusage.serviceUsageConsumer \
             roles/telemetry.tracesWriter roles/telemetry.metricsWriter roles/telemetry.logsWriter \
             roles/cloudtrace.agent roles/monitoring.metricWriter roles/logging.logWriter; do
@@ -36,6 +43,10 @@ for role in roles/aiplatform.user roles/discoveryengine.viewer roles/serviceusag
     --role "$role" --condition None --quiet
 done
 if [[ -n "${GCS_BUCKET:-}" ]]; then
+  echo "== GCS bucket (gs://$GCS_BUCKET)"
+  gcloud storage buckets describe "gs://$GCS_BUCKET" --project "$PROJECT" >/dev/null 2>&1 || \
+    gcloud storage buckets create "gs://$GCS_BUCKET" --project "$PROJECT" \
+      --location "$REGION" --uniform-bucket-level-access
   retry gcloud storage buckets add-iam-policy-binding "gs://$GCS_BUCKET" \
     --member "serviceAccount:$SA" --role roles/storage.objectCreator --quiet
 fi
@@ -48,8 +59,12 @@ ENV_VARS=(
   "GOOGLE_CLOUD_LOCATION=$GOOGLE_CLOUD_LOCATION"
   "VOICE_AGENT_MODEL=$VOICE_AGENT_MODEL"
   "VOICE_NAME=$VOICE_NAME"
+  "LANGUAGE_CODE=${LANGUAGE_CODE:-}"
   "DEFAULT_TIMEZONE=$DEFAULT_TIMEZONE"
   "FAQ_SEARCH_ENGINE_ID=$FAQ_SEARCH_ENGINE_ID"
+  "GATEWAY_URL=${GATEWAY_URL:-}"
+  "GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-5}"
+  "DEMO_MSISDNS=${DEMO_MSISDNS:-60123000005,60123000001}"
   "GCS_BUCKET=${GCS_BUCKET:-}"
   "GCS_LOG_PREFIX=$GCS_LOG_PREFIX"
   "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=$ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
