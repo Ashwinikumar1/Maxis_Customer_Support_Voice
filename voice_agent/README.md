@@ -70,9 +70,55 @@ read the same file.
 > same CES protocol.
 
 [`channels/ces_bridge.py`](channels/ces_bridge.py) answers the CES BidiRunSession protocol, so
-the **existing** `ces-genesys-adapter` drives our ADK agent. The protocol table, output variables
-and rollout steps are in the root README:
-[Genesys telephony](../README.md#genesys-telephony-reusing-the-gecx-genesys-adapter).
+the **existing** `ces-genesys-adapter` drives our ADK agent. AudioHook (the
+`genesys-audio-connector` service) can't be used for the bot: it is listen-only (Agent Assist).
+
+### Protocol mapping
+
+| Adapter → us | Our bridge |
+|---|---|
+| `{"config": {"session": "<app>/sessions/<conversationId>"}}` | `CallInfo.conversation_id` = ADK `session_id` and `X-Conversation-Id` |
+| `{"realtimeInput": {"variables": {...}}}` (Architect input variables) | Validated → `CallInfo.channel_vars` → session state `channel_vars` |
+| variable `msisdn` (or `ani`, `caller_id`), e.g. `tel:+60123456789` | Digits only → `CallInfo.msisdn` = ADK `user_id` and `X-Caller-Id`. Missing → `anonymous` (FAQ works, account tools refuse) |
+| `{"realtimeInput": {"event": {"event": "session_start"}}}` or `text` | Start the call; send kickstart text so the agent greets |
+| `{"realtimeInput": {"audio": "<b64 MULAW 8k>"}}` | MULAW → PCM16 16 kHz → `call.send_audio()` |
+| `{"realtimeInput": {"dtmf": "5"}}` | `call.send_text("[The caller pressed 5 on the keypad]")` |
+| `sys.remote-call-disconnected` event / `clientHalfClose` | Caller hung up → `endSession` (no params) → close |
+
+| Us → adapter | Meaning |
+|---|---|
+| `{"sessionOutput": {"audio": "<b64 MULAW 8k>"}}` | Bot speech (the adapter paces it to Genesys) |
+| `{"interruptionSignal": {}}` | Barge-in: the adapter clears its queued audio |
+| `{"endSession": {"metadata": {"params": {...}}}}` + close 1000 | Call over: the adapter plays out queued audio, then sends Genesys `disconnect` (completed) with params as **outputVariables** |
+| close 1011 | Internal error: the adapter sends `disconnect` (error), so Architect takes its failure path |
+
+### Output variables for Architect (flat strings)
+
+| Variable | When | Example |
+|---|---|---|
+| `outcome` | the agent decided | `handoff` or `end` |
+| `handoff_reason`, `summary` | handoff | why, and what the caller wanted (for the human agent) |
+| `use_case`, `destination`, `pass_name` | handoff, when known | `buy_a_pass`, `Japan`, `Asia 7-day pass` |
+| `end_reason` | end | `resolved`, `caller_done`, `no_response`, `unsupported_language` |
+
+> Escalation (`escalateToAgent`) is placeholder code and **not working yet**. These variables
+> are only sent once it's fixed and tested.
+
+### Rollout steps (waiting on permission)
+
+1. **Adapter, one line** in `src/ces_ws.py`:
+   `_BASE_WS_URL = os.getenv("CES_WS_URL", "wss://ces.googleapis.com/ws/google.cloud.ces.v1.SessionService/BidiRunSession/locations/")`.
+   Deploy it as a **second service from the same image**: repointing the shared
+   `ces-genesys-adapter-stg` would break the GECX bot. Set `CES_WS_URL=wss://<voice agent host>/ces/`
+   and `AUTH_TOKEN_SECRET_PATH=<token secret>`.
+2. **Token secret**: JSON `{"access_token": "<random ≥ 32 chars>", "expiry": <far-future epoch ms>}`.
+   Grant `secretAccessor` to both service accounts.
+3. **Deploy the voice agent** with `CES_BRIDGE_ENABLED=true`, `BROWSER_CHANNEL_ENABLED=false` and
+   `CES_BRIDGE_TOKEN_SECRET=<secret>`.
+4. **Architect** (staging flow + DID first): Call Audio Connector with input variables
+   `_agent_id = projects/<p>/locations/us/apps/adk` (the adapter requires it; only `us` is used, as
+   the URL suffix) and `msisdn = Call.Ani`. Branch on `outcome`; the failure path goes to a queue.
+5. **End-to-end staging call**, then the [production checklist](#production-checklist).
 
 Lifecycle of one adapter connection:
 
