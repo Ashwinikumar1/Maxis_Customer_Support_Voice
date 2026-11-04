@@ -33,7 +33,7 @@ traces, metrics and logs in **Cloud Observability**.
 > |---|---|
 > | Orchestrator `maxis_agent` (FAQ-first, English/Malay only) | Working (local + Cloud Run test) |
 > | Roaming specialist `roaming_agent` + gateway tools (real staging gateway, no mocks) | Working locally. Read tools live; **write tools (buy / switch / WhatsApp) disabled** until Maxis approves |
-> | Human handoff (`escalateToAgent` → call outcome) | Working: shown in the browser; becomes Genesys outputVariables on telephony |
+> | Human handoff (`escalateToAgent`) | **Not working yet**: placeholder code only (records a call outcome). Needs modification and testing before the Genesys queue transfer |
 > | Genesys telephony via the same `ces-genesys-adapter` GECX uses (`/ces` bridge) | **Built + offline-tested, not deployed.** Waiting on permission to deploy the adapter change (see [Genesys telephony](#genesys-telephony-reusing-the-gecx-genesys-adapter)) |
 > | Production deploy in Maxis project | Not done: needs service account, IAM grants and approval |
 
@@ -161,7 +161,7 @@ maxis_agent (orchestrator, Gemini Live)
     ├── helpWithWrongPass  POST /roaming/wrong-pass    (disabled)
     ├── switchRoaming      POST /roaming/switch        (disabled)
     ├── sendWhatsAppLink   POST /messages/whatsapp     (disabled)
-    └── escalateToAgent    local: sets call_outcome = handoff
+    └── escalateToAgent    placeholder: sets call_outcome = handoff (NOT working yet, needs changes + testing)
 ```
 
 - **Prompts**: [`prompts.py`](voice_agent/voice_assistant/prompts.py) (orchestrator),
@@ -388,6 +388,7 @@ Details (IAM roles, settings, observability, troubleshooting) are in
 
 ## Open items
 
+- **Escalation to a human agent**: placeholder code only, not working; modify and test, then wire to the Genesys queue transfer.
 - Permission to deploy the adapter change + token secret, then the staging end-to-end call.
 - Maxis: service account `maxis-voice-agent`, `run.invoker` on the gateway, production approval.
 - Staging roaming test numbers (family plan + single line); then enable write tools with approval.
