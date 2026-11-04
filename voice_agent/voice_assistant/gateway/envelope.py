@@ -20,3 +20,12 @@ def fail(code: str, message: str, action: str) -> dict:
       "violations": [{"code": code, "message": message, "action": action}],
       "timeStamp": _timestamp(),
   }
+
+
+def post_disabled() -> dict:
+  """TEMPORARY (prod-gateway testing): returned instead of every POST (buyPass,
+  switchRoaming, helpWithWrongPass, sendWhatsAppLink) so nothing changes on a real line.
+  The model follows action=offer_agent. Remove when POST calls are re-enabled.
+  """
+  return fail("ACTION_DISABLED_FOR_TESTING",
+              "I can't make changes or send messages on your line right now.", "offer_agent")

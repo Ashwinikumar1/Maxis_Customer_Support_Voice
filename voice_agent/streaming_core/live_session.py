@@ -16,6 +16,8 @@ How the pieces fit:
     client ◀──────── emit(...) ◀──────── run() loop ◀──────── ADK Events ◀────────┘
 """
 
+import logging
+import os
 import time
 
 from google.adk.agents import LiveRequestQueue
@@ -26,7 +28,12 @@ from opentelemetry import metrics, trace
 from .gcs_logger import TranscriptLogger
 from .utils import SEND_SAMPLE_RATE
 
+_log = logging.getLogger("voice_agent.live")
+
 MAX_TEXT_LEN = 2000  # cap typed messages so a client can't flood the model
+# Languages of the call (BCP-47) for the input/output transcripts: English + Malay.
+TRANSCRIPTION_LANGUAGES = [c.strip() for c in os.getenv(
+    "TRANSCRIPTION_LANGUAGE_CODES", "en-US,ms-MY").split(",") if c.strip()]
 
 # ADK's live mode only emits invoke_agent / execute_tool spans, not one per model
 # reply, so we add a "model_turn" span and a time-to-first-audio metric here.
@@ -50,7 +57,9 @@ def default_run_config(voice_name: str, language_code: str | None = None) -> Run
                                      treat it as a hint only; the system prompt
                                      remains the strongest language control.
   - input/output_audio_transcription: also return text of what the user said and
-                                     what the model said (for UI + transcript log)
+                                     what the model said (for UI + transcript log),
+                                     with English + Malay language hints
+                                     (TRANSCRIPTION_LANGUAGES)
   - session_resumption             : ADK transparently reconnects when Gemini closes
                                      the socket (~10 min limit) without losing context
   - context_window_compression     : sliding window so long calls don't hit the
@@ -65,8 +74,8 @@ def default_run_config(voice_name: str, language_code: str | None = None) -> Run
           ),
           language_code=language_code or None,
       ),
-      input_audio_transcription=types.AudioTranscriptionConfig(),
-      output_audio_transcription=types.AudioTranscriptionConfig(),
+      input_audio_transcription=types.AudioTranscriptionConfig(language_codes=TRANSCRIPTION_LANGUAGES),
+      output_audio_transcription=types.AudioTranscriptionConfig(language_codes=TRANSCRIPTION_LANGUAGES),
       session_resumption=types.SessionResumptionConfig(),
       context_window_compression=types.ContextWindowCompressionConfig(
           sliding_window=types.SlidingWindow()
@@ -135,6 +144,7 @@ class LiveVoiceSession:
     # to Gemini Live by run_live(). A NEW queue per conversation (never reuse).
     self.queue = LiveRequestQueue()
     self.turn = _TurnTracker(session_id)  # OTel: one "model_turn" span per reply
+    self._last_grounding = None  # dedupes repeated grounding_metadata within a turn
 
   # ===========================================================================
   # Client -> model (called by the server's upstream task)
@@ -190,7 +200,7 @@ class LiveVoiceSession:
     if author and author != "user" and author != current_agent:
       await emit("active_agent", name=author)
 
-    # --- Tool calls the model decided to make (e.g. search_knowledge_base).
+    # --- Function-tool calls the model decided to make (e.g. roaming gateway tools).
     # ADK executes the tool itself; we only report it to the UI and the log.
     for call in event.get_function_calls():
       args = dict(call.args or {})
@@ -202,6 +212,33 @@ class LiveVoiceSession:
     for resp in event.get_function_responses():
       turn.event("tool_result", tool=resp.name)
       await emit("tool_result", name=resp.name, response=resp.response or {}, author=author)
+
+    # --- Built-in Vertex AI Search (VertexAiSearchTool) runs inside Gemini Live, so
+    # there is no function call: the proof it ran is grounding_metadata. Live
+    # reports the search query as web_search_queries (even for a data store, it's
+    # the only search tool on the agent) on the turn_complete event, without
+    # chunks/URIs; generateContent uses retrieval_queries + grounding_chunks.
+    gm = getattr(event, "grounding_metadata", None)
+    if gm:
+      queries = list(gm.retrieval_queries or []) + list(gm.web_search_queries or [])
+      sources = []
+      for c in gm.grounding_chunks or []:
+        rc = c.retrieved_context
+        if rc and (rc.uri or rc.title):
+          sources.append({"title": rc.title or "", "uri": rc.uri or ""})
+      sig = (tuple(queries), tuple(s["uri"] for s in sources))
+      if (queries or sources) and sig != self._last_grounding:
+        self._last_grounding = sig
+        _log.info("Vertex AI Search grounding: queries=%s sources=%s",
+                  queries, [s["uri"] for s in sources])
+        turn.event("vertex_ai_search", queries=queries, sources=len(sources))
+        if queries:
+          await emit("tool_call", name="vertex_ai_search", args={"queries": queries}, author=author)
+        if sources:
+          await emit("tool_result", name="vertex_ai_search",
+                     response={"sources": sources}, author=author)
+        self.transcript.add_event("vertex_ai_search", queries=queries,
+                                  sources=[s["uri"] for s in sources], agent=author)
 
     # --- Model speech: PCM16 24 kHz audio chunks, streamed as they're generated.
     if event.content and event.content.parts:
@@ -241,4 +278,5 @@ class LiveVoiceSession:
       status = event.interaction_status
       state = status.value if status else "IDLE"
       turn.end(state.lower())
+      self._last_grounding = None
       await emit("turn_complete", state=state)

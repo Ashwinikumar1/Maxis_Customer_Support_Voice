@@ -2,8 +2,8 @@
 
 Each flow is a package exposing NAME and build_agent(current_date, model) -> Agent
 (mode="chat"). To add one (e.g. fibre): copy flows/roaming/ to flows/fibre/
-(agent.py, prompt.py with {{COMMON}}, tools.py via call_gateway, mock_backend.py)
-and add it to FLOWS below. The router picks it up automatically.
+(agent.py, prompt.py with {{COMMON}}, tools.py via call_gateway against the gw_*
+OpenAPI spec) and add it to FLOWS below. The router picks it up automatically.
 """
 
 from . import roaming

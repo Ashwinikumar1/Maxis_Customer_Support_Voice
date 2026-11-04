@@ -50,9 +50,10 @@ ENV_VARS=(
   "VOICE_NAME=$VOICE_NAME"
   "LANGUAGE_CODE=${LANGUAGE_CODE:-}"
   "DEFAULT_TIMEZONE=$DEFAULT_TIMEZONE"
-  "FAQ_SEARCH_ENGINE_ID=$FAQ_SEARCH_ENGINE_ID"
+  "FAQ_DATASTORE_ID=$FAQ_DATASTORE_ID"
   "GATEWAY_URL=${GATEWAY_URL:-}"
-  "GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-5}"
+  "GATEWAY_TIMEOUT_S=${GATEWAY_TIMEOUT_S:-15}"
+  "GATEWAY_AUTH=${GATEWAY_AUTH:-google_id_token}"
   "DEMO_MSISDNS=${DEMO_MSISDNS:-60123000005,60123000001}"
   "GCS_BUCKET=${GCS_BUCKET:-}"
   "GCS_LOG_PREFIX=$GCS_LOG_PREFIX"
@@ -60,13 +61,28 @@ ENV_VARS=(
   "OTEL_TO_CLOUD=true"
   "OTEL_SERVICE_NAME=$OTEL_SERVICE_NAME"
   "ALLOWED_ORIGINS=$SERVICE_URL"
+  "CES_BRIDGE_ENABLED=${CES_BRIDGE_ENABLED:-false}"
+  "CES_BRIDGE_KICKSTART_TEXT=${CES_BRIDGE_KICKSTART_TEXT:-Hello}"
+  "BROWSER_CHANNEL_ENABLED=${BROWSER_CHANNEL_ENABLED:-true}"
 )
 ENV_ARG="^@^$(IFS=@; echo "${ENV_VARS[*]}")"   # '@' delimiter: values may contain commas
+
+# Genesys bridge token: the SAME Secret Manager secret the ces-genesys-adapter reads
+# via AUTH_TOKEN_SECRET_PATH. Mounted as an env var; our SA needs secretAccessor on it.
+SECRET_ARGS=()
+if [[ -n "${CES_BRIDGE_TOKEN_SECRET:-}" ]]; then
+  retry gcloud secrets add-iam-policy-binding "$CES_BRIDGE_TOKEN_SECRET" --project "$PROJECT" \
+    --member "serviceAccount:$SA" --role roles/secretmanager.secretAccessor --quiet
+  SECRET_ARGS=(--set-secrets "CES_BRIDGE_TOKEN=${CES_BRIDGE_TOKEN_SECRET}:latest")
+fi
 
 echo "== Deploy $SERVICE -> $SERVICE_URL"
 # WebSocket voice calls need: long request timeout (max 60 min), session affinity,
 # and CPU kept allocated so audio streaming, the transcript upload and the trace
 # export keep running between requests (--no-cpu-throttling).
+# TODO(security): --allow-unauthenticated is needed because the adapter sends its own
+# Bearer token (checked in the app), not a Google ID token. For prod, also restrict
+# ingress (internal + adapter via Direct VPC egress, or LB + Cloud Armor).
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" --source . \
   --service-account "$SA" \
@@ -74,7 +90,7 @@ gcloud run deploy "$SERVICE" \
   --timeout 3600 --session-affinity --no-cpu-throttling \
   --cpu 2 --memory 1Gi --concurrency 20 \
   --min-instances "$CLOUD_RUN_MIN_INSTANCES" --max-instances "$CLOUD_RUN_MAX_INSTANCES" \
-  --set-env-vars "$ENV_ARG"
+  --set-env-vars "$ENV_ARG" ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"}
 
 echo
 echo "UI:     $SERVICE_URL"

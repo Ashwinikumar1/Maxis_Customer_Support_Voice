@@ -1,8 +1,12 @@
 """Tools any agent can use: WhatsApp links, escalation to a person, ending the call.
 
 Function names match the names used in the prompts (sendWhatsAppLink, escalateToAgent).
-escalateToAgent records a call outcome in session state; the channel (browser,
-Genesys) acts on it when the agent's reply is finished.
+
+- sendWhatsAppLink -> gateway POST /messages/whatsapp (gw_messages spec).
+- escalateToAgent and endCall don't call the gateway (it has no handoff API): they
+  record a call outcome in session state and the channel acts on it when the agent's
+  reply is finished (browser: shown in the UI; Genesys: "disconnect" with the outcome
+  as outputVariables, so the Architect flow transfers to a queue).
 endCall is NOT given to any agent for now (disabled on request); it's kept ready for
 telephony. To enable it: add it to the agents' tools and add a closing rule to the prompt.
 """
@@ -11,25 +15,30 @@ from typing import Literal, Optional
 
 from google.adk.tools import ToolContext
 
-from ..gateway import call_gateway
-from . import mock_backend  # noqa: F401  registers dummy handlers (used when GATEWAY_URL is unset)
+from ..gateway import call_gateway, ok, post_disabled, safe_tool  # noqa: F401 (call_gateway: POST re-enable)
 
 CALL_OUTCOME_KEY = "call_outcome"  # read by streaming_core.call (same key)
 
 
+@safe_tool
 async def sendWhatsAppLink(  # noqa: N802
-    kind: Literal["insurance", "manage_passes"], tool_context: ToolContext) -> dict:
-  """Sends the caller a WhatsApp message with a link. Only call it after the caller
-  has said yes to receiving it. The caller's number is added by the platform.
+    kind: Literal["manage_passes", "wrong_pass", "insurance"], tool_context: ToolContext) -> dict:
+  """Sends one approved WhatsApp message to the caller's own number, at most once per
+  call for each kind. Only send it after the caller agrees. The number is added by
+  the platform. Follow responseData.next_step.
 
   Args:
-    kind: insurance (the free travel insurance details) or manage_passes (the link
-      to manage roaming passes in the Maxis app).
+    kind: manage_passes (link to manage or cancel scheduled roaming passes in the
+      Maxis app), wrong_pass (help with a wrongly bought roaming pass) or insurance
+      (the free travel insurance offer).
   """
-  return await call_gateway("sendWhatsAppLink", "POST", "/messaging/whatsapp-link",
-                            tool_context, body={"kind": kind})
+  # TEMPORARY: POST disabled while testing on the PROD gateway (would message a real customer).
+  # return await call_gateway("sendWhatsAppLink", "POST", "/messages/whatsapp",
+  #                           tool_context, body={"kind": kind})
+  return post_disabled()
 
 
+@safe_tool
 async def escalateToAgent(  # noqa: N802
     reason: str,
     customer_request: str,
@@ -48,16 +57,13 @@ async def escalateToAgent(  # noqa: N802
     destination: The trip destination, when known.
     pass_name: The pass involved, when known.
   """
-  body = {"reason": reason[:200], "customer_request": customer_request[:500],
-          "use_case": use_case, "destination": destination, "pass_name": pass_name}
-  result = await call_gateway("escalateToAgent", "POST", "/handoff/agent", tool_context, body=body)
-  if result.get("status") == "success":
-    # The channel hands the call over once this reply is finished
-    # (Genesys: "disconnect" with these as outputVariables -> Architect routes to a queue).
-    _set_outcome(tool_context, {"action": "handoff", **{k: v for k, v in body.items() if v}})
-  return result
+  params = {"reason": (reason or "")[:200], "customer_request": (customer_request or "")[:500],
+            "use_case": use_case, "destination": destination, "pass_name": pass_name}
+  _set_outcome(tool_context, {"action": "handoff", **{k: v for k, v in params.items() if v}})
+  return ok({"next_step": "tell_caller_connecting"})
 
 
+@safe_tool
 async def endCall(  # noqa: N802
     reason: Literal["resolved", "caller_done", "no_response", "unsupported_language"],
     tool_context: ToolContext,

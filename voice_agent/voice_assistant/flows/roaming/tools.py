@@ -1,22 +1,32 @@
-"""Roaming tools: one function per OpenAPI operation, all via the shared gateway client.
+"""Roaming tools: one function per gw_roaming OpenAPI operation, via the shared gateway client.
 
 Function names match the operationIds the roaming prompt uses (listRoamingLines,
-findPasses, ...). The MSISDN and conversation id are added by call_gateway from
-session state; they are never parameters, so the model can't see or change them.
+findPasses, ...). call_gateway adds the headers: Bearer ID token, X-Caller-Id (the
+MSISDN from session state) and X-Conversation-Id. The MSISDN is never a parameter,
+so the model can't see or change it.
+
+| Tool              | Gateway call               |
+|-------------------|----------------------------|
+| listRoamingLines  | GET  /roaming/lines        |
+| findPasses        | GET  /roaming/passes       |
+| buyPass           | POST /roaming/purchases    |
+| listMyPasses      | GET  /roaming/purchases    |
+| helpWithWrongPass | POST /roaming/wrong-pass   |
+| switchRoaming     | POST /roaming/switch       |
 """
 
 from typing import Literal, Optional
 
 from google.adk.tools import ToolContext
 
-from ...gateway import call_gateway
-from . import mock_backend  # noqa: F401  registers dummy handlers (used when GATEWAY_URL is unset)
+from ...gateway import call_gateway, post_disabled, safe_tool
 
 
 def _clip(value: Optional[str], limit: int = 120) -> Optional[str]:
   return value.strip()[:limit] if isinstance(value, str) else value
 
 
+@safe_tool
 async def listRoamingLines(tool_context: ToolContext) -> dict:  # noqa: N802
   """Lines the caller can manage for roaming: their own line and, for a principal
   line, its share lines, with whether roaming is on and whether each can buy a
@@ -26,6 +36,7 @@ async def listRoamingLines(tool_context: ToolContext) -> dict:  # noqa: N802
   return await call_gateway("listRoamingLines", "GET", "/roaming/lines", tool_context)
 
 
+@safe_tool
 async def findPasses(  # noqa: N802
     destinations: str,
     tool_context: ToolContext,
@@ -52,6 +63,7 @@ async def findPasses(  # noqa: N802
   return await call_gateway("findPasses", "GET", "/roaming/passes", tool_context, query=query)
 
 
+@safe_tool
 async def buyPass(  # noqa: N802
     pass_id: str,
     destinations: str,
@@ -73,12 +85,15 @@ async def buyPass(  # noqa: N802
     line_ref: The line it's for, from listRoamingLines. Leave out for the caller's own line.
     confirmed: True only after the caller has agreed to the summary.
   """
-  body = {"pass_id": _clip(pass_id, 40), "destinations": _clip(destinations, 300),
-          "start_date": _clip(start_date, 10), "line_ref": _clip(line_ref, 40),
-          "confirmed": True if confirmed is True else None}
-  return await call_gateway("buyPass", "POST", "/roaming/purchases", tool_context, body=body)
+  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
+  # body = {"pass_id": _clip(pass_id, 40), "destinations": _clip(destinations, 300),
+  #         "start_date": _clip(start_date, 10), "line_ref": _clip(line_ref, 40),
+  #         "confirmed": True if confirmed is True else None}
+  # return await call_gateway("buyPass", "POST", "/roaming/purchases", tool_context, body=body)
+  return post_disabled()
 
 
+@safe_tool
 async def listMyPasses(  # noqa: N802
     tool_context: ToolContext,
     when: Optional[Literal["scheduled", "active", "past", "all"]] = None,
@@ -97,6 +112,7 @@ async def listMyPasses(  # noqa: N802
   return await call_gateway("listMyPasses", "GET", "/roaming/purchases", tool_context, query=query)
 
 
+@safe_tool
 async def helpWithWrongPass(  # noqa: N802
     pass_ref: str, tool_context: ToolContext, line_ref: Optional[str] = None) -> dict:
   """What can be done about a pass bought by mistake, applying Maxis's rule: a
@@ -108,11 +124,14 @@ async def helpWithWrongPass(  # noqa: N802
     pass_ref: pass_ref from listMyPasses.
     line_ref: The line, from listRoamingLines. Leave out for the caller's own line.
   """
-  body = {"pass_ref": _clip(pass_ref, 40), "line_ref": _clip(line_ref, 40)}
-  return await call_gateway("helpWithWrongPass", "POST", "/roaming/wrong-pass", tool_context,
-                            body=body)
+  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
+  # body = {"pass_ref": _clip(pass_ref, 40), "line_ref": _clip(line_ref, 40)}
+  # return await call_gateway("helpWithWrongPass", "POST", "/roaming/wrong-pass", tool_context,
+  #                           body=body)
+  return post_disabled()
 
 
+@safe_tool
 async def switchRoaming(  # noqa: N802
     turn: Literal["on", "off"],
     tool_context: ToolContext,
@@ -133,10 +152,12 @@ async def switchRoaming(  # noqa: N802
     acknowledged_active_pass: True when the caller heard the warning about their
       passes and still wants roaming off.
   """
-  body = {"turn": turn, "line_ref": _clip(line_ref, 40),
-          "confirmed": True if confirmed is True else None,
-          "acknowledged_active_pass": True if acknowledged_active_pass is True else None}
-  return await call_gateway("switchRoaming", "POST", "/roaming/switch", tool_context, body=body)
+  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
+  # body = {"turn": turn, "line_ref": _clip(line_ref, 40),
+  #         "confirmed": True if confirmed is True else None,
+  #         "acknowledged_active_pass": True if acknowledged_active_pass is True else None}
+  # return await call_gateway("switchRoaming", "POST", "/roaming/switch", tool_context, body=body)
+  return post_disabled()
 
 
 ROAMING_TOOLS = [listRoamingLines, findPasses, buyPass, listMyPasses, helpWithWrongPass,

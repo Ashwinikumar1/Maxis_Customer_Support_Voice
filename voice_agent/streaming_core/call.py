@@ -23,6 +23,7 @@ from typing import Awaitable, Callable
 
 from google.adk.runners import Runner
 
+from .bridge_sound import BridgeSound
 from .gcs_logger import TranscriptLogger
 from .live_session import LiveVoiceSession
 from .utils import SEND_SAMPLE_RATE, get_datetime_info
@@ -70,7 +71,8 @@ class Call:
     ctx = get_datetime_info(info.timezone)
     # Identity goes into session state: tools (via the gateway client) read it from
     # there, so it's never a tool parameter the model could see or change.
-    state = {**ctx, "msisdn": info.msisdn, "conversation_id": info.conversation_id,
+    state = {**ctx, "msisdn": info.msisdn, "caller_id": info.msisdn,
+             "conversation_id": info.conversation_id,
              "channel": info.channel, "channel_vars": dict(info.channel_vars)}
     await session_service.create_session(app_name=app_name, user_id=info.msisdn,
                                          session_id=info.conversation_id, state=state)
@@ -93,18 +95,32 @@ class Call:
   # --- Model -> channel --------------------------------------------------------
   async def run(self, emit: Emit):
     """Streams model events to the channel until the live session ends."""
+    bridge = BridgeSound(emit)  # keyboard clicks while ADK switches agents
+
     async def forward(kind, **data):
       if kind == "transcript" and _MARKERS_ONLY.fullmatch(data.get("text") or ""):
         return  # "<no speech>", "{pause}": transcription markers, not words
       if self.ended.is_set() and kind != "transcript":
         # Call is over: no more audio (e.g. the model's "<no speech>{pause}" reply
         # after endCall). Text still passes: the goodbye's transcript lags its audio.
+        bridge.stop()
         return
+      if kind == "audio":                      # an agent is speaking (again)
+        bridge.stop()
+        bridge.note_audio(len(data["data"]))
+      elif kind == "tool_call" and data.get("name") != "vertex_ai_search":
+        bridge.start()                         # tool call or transfer: the caller waits
+      elif kind == "interrupted":              # barge-in: caller's audio queue flushed
+        bridge.stop()
+        bridge.clear()
       await emit(kind, **data)
       if self.outcome is None and kind in ("tool_result", "turn_complete"):
         await self._check_outcome(kind, data, emit)
 
-    await self.live.run(forward)
+    try:
+      await self.live.run(forward)
+    finally:
+      bridge.stop()
 
   async def _check_outcome(self, kind: str, data: dict, emit: Emit):
     """endCall: over as soon as the tool runs (the goodbye was said before it).

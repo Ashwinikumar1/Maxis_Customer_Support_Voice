@@ -15,11 +15,14 @@
     </div>
     <div class="controls">
       <span id="statusText">Not connected</span>
-      <label for="msisdnSelect" class="sr-label">Caller</label>
-      <select id="msisdnSelect" title="Demo caller (MSISDN)">
-        <option value="60123000005">Family plan, 5 lines (60123000005)</option>
-        <option value="60123000001">Single line (60123000001)</option>
-      </select>
+      <label for="msisdnInput" class="sr-label">Caller number</label>
+      <input id="msisdnInput" type="tel" inputmode="numeric" maxlength="20" autocomplete="off"
+             list="msisdnSuggestions" placeholder="Caller, e.g. 60123186001"
+             title="Caller number (MSISDN), sent as X-Caller-Id" value="60123186001" />
+      <datalist id="msisdnSuggestions">
+        <option value="60123186001"></option>
+        <option value="60164129768"></option>
+      </datalist>
       <button id="micBtn" class="primary">Start talking</button>
     </div>
   </header>

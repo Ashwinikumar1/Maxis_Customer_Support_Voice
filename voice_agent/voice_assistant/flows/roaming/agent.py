@@ -1,9 +1,13 @@
 """Roaming specialist agent (chat mode: it keeps the caller for the whole roaming
-conversation, then transfers back to maxis_agent or to a sibling flow)."""
+conversation, then transfers back to maxis_agent or to a sibling flow).
+
+Always attached to maxis_agent as a sub-agent (see voice_assistant/agent.py).
+Its tools call the Maxis agent gateway (gw_roaming / gw_messages specs). FAQ
+questions go back to maxis_agent, which grounds on Vertex AI Search.
+"""
 
 from google.adk.agents import Agent
 
-from ...faq_search_tool import search_knowledge_base
 from ...shared.tools import escalateToAgent, sendWhatsAppLink
 from .prompt import roaming_instruction
 from .tools import ROAMING_TOOLS
@@ -24,5 +28,5 @@ def build_agent(current_date: str, model: str) -> Agent:
       mode="chat",
       description=DESCRIPTION,
       instruction=roaming_instruction(current_date),
-      tools=[*ROAMING_TOOLS, search_knowledge_base, sendWhatsAppLink, escalateToAgent],
+      tools=[*ROAMING_TOOLS, sendWhatsAppLink, escalateToAgent],
   )

@@ -11,6 +11,9 @@ server -> client : {"type":"ready"} {"type":"audio","data":b64 PCM16 24k}
                    {"type":"tool_result","name","response","author"}
                    {"type":"interrupted"} {"type":"turn_complete","state"} {"type":"error"}
 
+Telephony: wss://HOST/ces/<location> speaks the CES BidiRunSession protocol for the
+existing ces-genesys-adapter (Genesys Audio Connector) - see channels/ces_bridge.py.
+
 Run:  uv run python server.py   ->  http://127.0.0.1:8080
 """
 
@@ -44,10 +47,12 @@ from websockets.datastructures import Headers  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.http11 import Response  # noqa: E402
 
+from channels import ces_bridge  # noqa: E402
 from streaming_core import (  # noqa: E402
     Call, CallInfo, default_run_config, logger)
 from voice_assistant.agent import create_root_agent  # noqa: E402
-from voice_assistant.gateway.client import MSISDN_RE  # noqa: E402
+from voice_assistant.gateway.auth import warm_up_token  # noqa: E402
+from voice_assistant.gateway.client import MSISDN_RE, gateway_url  # noqa: E402
 from opentelemetry import trace  # noqa: E402
 
 
@@ -100,12 +105,17 @@ INIT_TIMEOUT_S = 5.0        # how long to wait for the client's {"type":"init"} 
 MAX_B64_LEN = 512 * 1024    # reject oversized audio frames (DoS protection)
 END_CALL_GRACE_S = 5.0      # after endCall/handoff: time for the goodbye to play, then hang up
 # MSISDN = the caller's number; it is the ADK user_id and is sent to every gateway call.
-# Browser channel has no real caller, so it uses demo numbers. The first is the default;
-# the UI may pick another, but only from this allow-list (never a free-form number).
+# Browser channel has no real caller: the UI sends a number. By default only numbers in
+# DEMO_MSISDNS are accepted (first = default). ALLOW_ANY_MSISDN=true (TESTING ONLY) accepts
+# any typed number: never enable it on a public deployment, since the gateway trusts it.
 # TODO(security): on telephony (Genesys), take the MSISDN from the verified ANI in the
 # call metadata and ignore anything the client sends.
 DEMO_MSISDNS = [m.strip() for m in os.getenv("DEMO_MSISDNS", "60123000005,60123000001").split(",")
                 if MSISDN_RE.fullmatch(m.strip())]
+ALLOW_ANY_MSISDN = os.getenv("ALLOW_ANY_MSISDN", "false").strip().lower() == "true"
+# Browser UI + /ws (demo/testing channel). Set false on the telephony (production)
+# deployment so only the authenticated /ces bridge is reachable.
+BROWSER_CHANNEL_ENABLED = os.getenv("BROWSER_CHANNEL_ENABLED", "true").strip().lower() == "true"
 
 # ADK SessionService stores conversation history/state per session.
 # Created ONCE and shared by all connections (per ADK custom-server guidance).
@@ -152,6 +162,15 @@ def process_request(connection, request):
   that is expected and just means a file was served.
   """
   path = request.path.split("?", 1)[0]
+  if ces_bridge.is_bridge_path(path):  # telephony: ces-genesys-adapter -> our agent
+    if not ces_bridge.ENABLED:
+      return _http(HTTPStatus.NOT_FOUND, b"Not found")
+    if not ces_bridge.authorized(request.headers):
+      logger.warning("CES bridge: rejected unauthenticated connection")
+      return _http(HTTPStatus.UNAUTHORIZED, b"Unauthorized")
+    return None  # continue WebSocket handshake
+  if not BROWSER_CHANNEL_ENABLED:
+    return _http(HTTPStatus.NOT_FOUND, b"Not found")
   if path == "/ws":
     if request.headers.get("Origin") not in ALLOWED_ORIGINS:  # cross-site WS hijacking
       return _http(HTTPStatus.FORBIDDEN, b"Forbidden")
@@ -169,8 +188,35 @@ def process_request(connection, request):
 async def handle_client(websocket):
   # One root span per conversation: every ADK span (agent, model, tool) created
   # inside becomes a child, so Cloud Trace shows the whole call as one trace.
+  # process_request already authenticated the path, so dispatch on it here.
+  path = websocket.request.path.split("?", 1)[0]
   with tracer.start_as_current_span("voice_session"):
-    await _handle_client(websocket)
+    if ces_bridge.is_bridge_path(path):
+      await ces_bridge.handle(websocket, start_call=_start_call)
+    else:
+      await _handle_client(websocket)
+
+
+_background: set[asyncio.Task] = set()  # keeps fire-and-forget tasks referenced
+
+
+async def _start_call(info: CallInfo) -> Call:
+  """Starts a call for any channel. CallInfo is all a channel must provide:
+    MSISDN          -> ADK user_id, and X-Caller-Id on every gateway call
+    conversation_id -> ADK session_id, and X-Conversation-Id on every gateway call
+  """
+  trace.get_current_span().set_attribute("session.id", info.conversation_id)  # trace <-> transcript
+  call = await Call.start(info, session_service=session_service, app_name=APP_NAME,
+                          agent_factory=create_root_agent,
+                          run_config=default_run_config(VOICE_NAME, LANGUAGE_CODE))
+  logger.info("Session %s started (%s, %s, msisdn ...%s)", info.conversation_id, info.channel,
+              call.ctx["timezone"], info.msisdn[-4:])
+  # Get the gateway token now, in the background, so the first roaming tool call
+  # doesn't wait for it (cached for ~1 h; failures are ignored here).
+  task = asyncio.create_task(asyncio.to_thread(warm_up_token, gateway_url()))
+  _background.add(task)
+  task.add_done_callback(_background.discard)
+  return call
 
 
 async def _handle_client(websocket):
@@ -202,18 +248,12 @@ async def _handle_client(websocket):
   except ConnectionClosed:
     return  # client left before the call started: nothing to clean up
 
-  # --- 4b. Start the call. CallInfo is all a channel must provide:
-  #   MSISDN          -> ADK user_id, and X-Caller-Id on every gateway call
-  #   conversation_id -> ADK session_id, and X-Conversation-Id on every gateway call
+  # --- 4b. Start the call (see _start_call).
   # The browser has no telephony ids, so it uses a demo MSISDN and a random id.
   info = CallInfo(msisdn=_resolve_msisdn(requested_msisdn), conversation_id=uuid.uuid4().hex,
                   channel="browser", timezone=timezone)
-  trace.get_current_span().set_attribute("session.id", info.conversation_id)  # trace <-> transcript
-  call = await Call.start(info, session_service=session_service, app_name=APP_NAME,
-                          agent_factory=create_root_agent,
-                          run_config=default_run_config(VOICE_NAME, LANGUAGE_CODE))
-  logger.info("Session %s started (%s, %s, msisdn ...%s)", info.conversation_id, info.channel,
-              call.ctx["timezone"], info.msisdn[-4:])
+  call = await _start_call(info)
+  await send({"type": "caller", "msisdn": info.msisdn})  # UI shows the number actually used
 
   # --- 4c. UPSTREAM task: browser -> Gemini.
   # Reads WebSocket messages and pushes them into the call:
@@ -304,10 +344,13 @@ def _b64(raw) -> bytes:
 
 
 def _resolve_msisdn(requested) -> str:
-  """The call's MSISDN: an allow-listed demo number the client asked for, else the default."""
+  """The call's MSISDN: the typed number if allowed, else the first DEMO_MSISDNS entry."""
+  requested = str(requested or "").strip()
+  if MSISDN_RE.fullmatch(requested) and (ALLOW_ANY_MSISDN or requested in DEMO_MSISDNS):
+    return requested
   if not DEMO_MSISDNS:
     raise RuntimeError("DEMO_MSISDNS has no valid MSISDN (digits only, 8-15 long)")
-  return requested if requested in DEMO_MSISDNS else DEMO_MSISDNS[0]
+  return DEMO_MSISDNS[0]
 
 
 # =============================================================================

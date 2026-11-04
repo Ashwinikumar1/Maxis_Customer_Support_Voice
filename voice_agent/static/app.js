@@ -106,8 +106,12 @@
         break;
       case "tool_result": {
         const r = msg.response || {};
-        if (msg.name !== "transfer_to_agent") {
-          addActivity("tool", `${msg.name} → ${r.status || (r.error ? "error" : "done")}`);
+        if (msg.name === "vertex_ai_search") {
+          const n = (r.sources || []).length;
+          addActivity("tool", `vertex_ai_search → ${n} source${n === 1 ? "" : "s"}`);
+        } else if (msg.name !== "transfer_to_agent") {
+          const code = (r.violations && r.violations[0] && r.violations[0].code) || "";
+          addActivity("tool", `${msg.name} → ${r.status || (r.error ? "error" : "done")} ${code}`);
         }
         break;
       }
@@ -122,6 +126,9 @@
         break;
       case "error":
         addActivity("error", msg.message);
+        break;
+      case "caller":
+        addActivity("agent", "Caller (X-Caller-Id): " + msg.msisdn);
         break;
       case "call_outcome":
         // On telephony this hands the call to a person or hangs up; here we just show it.
@@ -150,8 +157,24 @@
     return bytes.buffer;
   }
 
+  // Typed caller number -> digits only, Malaysian format ("+60 16-412 9768" or
+  // "016-412 9768" -> "60164129768"). Returns "" if it isn't 8-15 digits.
+  function normaliseMsisdn(raw) {
+    let digits = (raw || "").replace(/\D/g, "");
+    if (digits.startsWith("0")) digits = "6" + digits;
+    return /^[0-9]{8,15}$/.test(digits) ? digits : "";
+  }
+
   // ---------- Audio + connection ----------
   async function start() {
+    const msisdnInput = document.getElementById("msisdnInput");
+    const msisdn = normaliseMsisdn(msisdnInput.value);
+    if (!msisdn) {
+      setStatus("Enter a valid caller number", "");
+      msisdnInput.focus();
+      return;
+    }
+    msisdnInput.value = msisdn;
     setStatus("Connecting…", "wait");
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -179,11 +202,11 @@
 
     ws.onopen = () => {
       const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const msisdnSelect = document.getElementById("msisdnSelect");
-      // Demo only: the server accepts this only if it's in its DEMO_MSISDNS allow-list.
-      ws.send(JSON.stringify({ type: "init", timezone, msisdn: msisdnSelect.value }));
-      msisdnSelect.disabled = true;
-      ws.addEventListener("close", () => { msisdnSelect.disabled = false; });
+      // Testing only: the server uses this number if ALLOW_ANY_MSISDN=true, otherwise
+      // only if it's in DEMO_MSISDNS. It's sent to the gateway as X-Caller-Id.
+      ws.send(JSON.stringify({ type: "init", timezone, msisdn }));
+      msisdnInput.disabled = true;
+      ws.addEventListener("close", () => { msisdnInput.disabled = false; });
       setConnected(true);
       setStatus("Listening", "on");
       agentPill.textContent = "voice_assistant";
