@@ -13,6 +13,20 @@ The same agent serves two channels:
 Everything runs as one container on **Cloud Run**, with transcripts in **Cloud Storage** and
 traces, metrics and logs in **Cloud Observability**.
 
+> [!IMPORTANT]
+> **Same Genesys adapter as GECX, our own ADK agent behind it.**
+> Phone calls use the **same `ces-genesys-adapter`** that connects Genesys to **Gemini Enterprise
+> for CX (GECX / CX Agent Studio)**, already running for Maxis as `ces-genesys-adapter-stg`. No new
+> Genesys integration is built. The adapter keeps doing all the Genesys work. The only change is
+> its backend URL: instead of the GECX (CES) service, it points to our **custom ADK code**, which
+> answers the same CES protocol ([`channels/ces_bridge.py`](voice_agent/channels/ces_bridge.py)).
+>
+> ```
+> GECX today :  Genesys ─▶ ces-genesys-adapter ─▶ GECX / CES (CX Agent Studio agent)
+> This repo  :  Genesys ─▶ ces-genesys-adapter ─▶ our ADK agent (/ces bridge → Gemini Live)
+>                          └──────── same adapter, same Genesys setup ────────┘
+> ```
+
 > **Status (4 Nov 2026)**
 >
 > | Area | State |
@@ -20,7 +34,7 @@ traces, metrics and logs in **Cloud Observability**.
 > | Orchestrator `maxis_agent` (FAQ-first, English/Malay only) | Working (local + Cloud Run test) |
 > | Roaming specialist `roaming_agent` + gateway tools (real staging gateway, no mocks) | Working locally. Read tools live; **write tools (buy / switch / WhatsApp) disabled** until Maxis approves |
 > | Human handoff (`escalateToAgent` → call outcome) | Working: shown in the browser; becomes Genesys outputVariables on telephony |
-> | Genesys telephony via the existing adapter (`/ces` bridge) | **Built + offline-tested, not deployed.** Waiting on permission to deploy the adapter change (see [Genesys telephony](#genesys-telephony-reusing-the-existing-adapter)) |
+> | Genesys telephony via the same `ces-genesys-adapter` GECX uses (`/ces` bridge) | **Built + offline-tested, not deployed.** Waiting on permission to deploy the adapter change (see [Genesys telephony](#genesys-telephony-reusing-the-gecx-genesys-adapter)) |
 > | Production deploy in Maxis project | Not done: needs service account, IAM grants and approval |
 
 ---
@@ -30,7 +44,7 @@ traces, metrics and logs in **Cloud Observability**.
 1. [Architecture](#architecture)
 2. [What happens in one call](#what-happens-in-one-call)
 3. [Agents and tools](#agents-and-tools)
-4. [Genesys telephony: reusing the existing adapter](#genesys-telephony-reusing-the-existing-adapter)
+4. [Genesys telephony: reusing the GECX Genesys adapter](#genesys-telephony-reusing-the-gecx-genesys-adapter)
 5. [Repository layout](#repository-layout)
 6. [Where to make a change](#where-to-make-a-change)
 7. [Quick start (local)](#quick-start-local)
@@ -169,17 +183,28 @@ maxis_agent (orchestrator, Gemini Live)
 
 ---
 
-## Genesys telephony: reusing the existing adapter
+## Genesys telephony: reusing the GECX Genesys adapter
 
-Maxis already runs Google's open-source
-[`ces-genesys-adapter`](https://github.com/GoogleCloudPlatform/ces-genesys-adapter) on Cloud Run
-(`ces-genesys-adapter-stg`) for the CX Agent Studio bot. It does all the Genesys work: API key +
-HTTP message signature, `open`/`opened`, ping, DTMF, audio pacing, barge-in buffer clearing, and
-`disconnect` with outputVariables. Only its backend client (`ces_ws.py`) is CES-specific.
+> [!IMPORTANT]
+> We use **the same Genesys adapter that GECX (Gemini Enterprise for CX / CX Agent Studio)
+> uses**: Google's open-source
+> [`ces-genesys-adapter`](https://github.com/GoogleCloudPlatform/ces-genesys-adapter), already on
+> Cloud Run for Maxis (`ces-genesys-adapter-stg`). We **don't build a new Genesys integration**. We
+> point the adapter at our **custom ADK code**, which answers the same CES protocol as GECX.
 
-So instead of writing our own Genesys endpoint, **our server speaks the CES BidiRunSession
-protocol** on `/ces/<location>` ([`channels/ces_bridge.py`](voice_agent/channels/ces_bridge.py)).
-The adapter needs a single change: make its CES URL configurable.
+| | GECX setup (today) | ADK setup (this repo) |
+|---|---|---|
+| Genesys org, Audio Connector integration, Architect "Call Audio Connector" | ✅ | ✅ same |
+| `ces-genesys-adapter` code and image | ✅ | ✅ same, plus one line: CES URL read from `CES_WS_URL` |
+| Genesys auth (API key + HTTP signature), open/ping/DTMF, audio pacing, barge-in, `disconnect` + outputVariables | done by the adapter | done by the adapter (unchanged) |
+| Backend the adapter connects to | GECX / CES `BidiRunSession` (CX Agent Studio agent) | our `/ces` bridge → ADK agents → Gemini Live |
+| Agent logic, prompts, tools | CX Agent Studio | custom ADK code (`voice_assistant/`) |
+
+The adapter does all the Genesys work. Only its backend client (`ces_ws.py`) talks to GECX. So
+**our server speaks the same CES BidiRunSession protocol** on `/ces/<location>`
+([`channels/ces_bridge.py`](voice_agent/channels/ces_bridge.py)), and the adapter can't tell
+the difference. The only adapter change is making its CES URL configurable. GECX and the ADK
+agent can run side by side: two services from the same adapter image, each with its own URL.
 
 > **Why not the AudioHook integration** (`agent-assist-integrations/genesyscloud-audiohook`, the
 > `genesys-audio-connector` service)? AudioHook is **listen-only** (no audio back to the caller,

@@ -1,5 +1,9 @@
 """CES-protocol bridge: lets the existing ces-genesys-adapter drive our ADK agent.
 
+This is the SAME Genesys adapter GECX (Gemini Enterprise for CX / CX Agent Studio)
+uses. We don't build a new Genesys integration: the adapter's backend URL points here
+instead of to GECX, and this module answers the same CES protocol with custom ADK code.
+
 The adapter (github.com/GoogleCloudPlatform/ces-genesys-adapter, already on Cloud
 Run for Maxis) handles everything Genesys: API key + signature check, open/opened,
 ping, DTMF, audio pacing, clearing buffered audio on barge-in, and the final

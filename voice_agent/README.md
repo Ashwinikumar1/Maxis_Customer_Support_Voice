@@ -63,10 +63,16 @@ read the same file.
 
 ## Genesys telephony bridge (`/ces`)
 
+> [!IMPORTANT]
+> The phone channel reuses **the same `ces-genesys-adapter` that GECX (Gemini Enterprise for CX /
+> CX Agent Studio) uses** with Genesys. The Genesys setup and adapter code stay the same; the
+> adapter's backend URL points here instead of to GECX, and our **custom ADK code** answers the
+> same CES protocol.
+
 [`channels/ces_bridge.py`](channels/ces_bridge.py) answers the CES BidiRunSession protocol, so
 the **existing** `ces-genesys-adapter` drives our ADK agent. The protocol table, output variables
 and rollout steps are in the root README:
-[Genesys telephony](../README.md#genesys-telephony-reusing-the-existing-adapter).
+[Genesys telephony](../README.md#genesys-telephony-reusing-the-gecx-genesys-adapter).
 
 Lifecycle of one adapter connection:
 
