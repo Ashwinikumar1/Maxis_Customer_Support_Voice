@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Environment and Secrets
+.env*
+*.env
+!.env.example
+
+# Logs
+*.log
+
+# Deployment and Configuration Scripts
+script/values.sh
+script/values-*.sh
+!script/values.sh.example
+script/deploy-*.sh
+tmp/
+tests
+

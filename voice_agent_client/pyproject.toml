@@ -1,0 +1,9 @@
+[project]
+name = "voice-agent-client"
+version = "0.1.0"
+description = "Local test client for the Maxis voice agent server (/ces, same protocol as Genesys)"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.2.4",
+    "websockets>=15",
+]
