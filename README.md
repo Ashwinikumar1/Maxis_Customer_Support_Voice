@@ -9,9 +9,11 @@ takes phone calls through **Genesys**. Runs as one container on **Cloud Run**.
 | ADK agent: FAQ, roaming flow, Maxis gateway | ✅ Working (staging gateway; write actions disabled until approved). Greeting ~2 s |
 | Escalation to a human agent | ⚠️ Placeholder code only, **not working yet**: deferred until the Genesys integration works |
 | Genesys telephony (`/ces` bridge) | 🟢 Works end to end locally with the real `ces-genesys-adapter` code ([voice_agent_client/adapter_test](voice_agent_client/adapter_test/README.md)); [rollout plan](Documents/Genesys_Adapter_Rollout.md) waiting on Maxis |
-| Cloud Run in Maxis project | ⏳ Waiting on service account, IAM and approval |
+| Cloud Run in Maxis project (`asia-southeast1`) | 🟢 Deployed (`ces-genesys-adapter-adk-stg` + `maxis-voice-agent` in Singapore); pending dedicated SAs, org policy tag, and Cloud Armor LB |
 
 Progress tracker: [`Documents/Maxis_Voice_Agent_Tracker.xlsx`](Documents/Maxis_Voice_Agent_Tracker.xlsx).
+
+![Maxis Customer Support Voice Agent — Google Cloud Architecture](Documents/gcp-architecture.png)
 
 ---
 
