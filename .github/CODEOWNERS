@@ -1,0 +1,6 @@
+# Code owners for PR review enforcement on main.
+# At least 1 approval from a code owner is required to merge into main:
+#   - Ashwini (@Ashwinikumar1)
+#   - Hima (@himaks1)
+#   - Derick Chen (@buildwithdc)
+* @Ashwinikumar1 @himaks1 @buildwithdc
