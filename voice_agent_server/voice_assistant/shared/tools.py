@@ -15,7 +15,7 @@ from typing import Literal, Optional
 
 from google.adk.tools import ToolContext
 
-from ..gateway import call_gateway, ok, post_disabled, safe_tool  # noqa: F401 (call_gateway: POST re-enable)
+from ..gateway import call_gateway, ok, safe_tool
 
 CALL_OUTCOME_KEY = "call_outcome"  # read by streaming_core.call (same key)
 
@@ -32,10 +32,8 @@ async def sendWhatsAppLink(  # noqa: N802
       Maxis app), wrong_pass (help with a wrongly bought roaming pass) or insurance
       (the free travel insurance offer).
   """
-  # TEMPORARY: POST disabled while testing on the PROD gateway (would message a real customer).
-  # return await call_gateway("sendWhatsAppLink", "POST", "/messages/whatsapp",
-  #                           tool_context, body={"kind": kind})
-  return post_disabled()
+  return await call_gateway("sendWhatsAppLink", "POST", "/messages/whatsapp",
+                            tool_context, body={"kind": kind})
 
 
 @safe_tool

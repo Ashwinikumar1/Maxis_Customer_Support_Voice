@@ -19,7 +19,7 @@ from typing import Literal, Optional
 
 from google.adk.tools import ToolContext
 
-from ...gateway import call_gateway, post_disabled, safe_tool
+from ...gateway import call_gateway, safe_tool
 
 
 def _clip(value: Optional[str], limit: int = 120) -> Optional[str]:
@@ -85,12 +85,10 @@ async def buyPass(  # noqa: N802
     line_ref: The line it's for, from listRoamingLines. Leave out for the caller's own line.
     confirmed: True only after the caller has agreed to the summary.
   """
-  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
-  # body = {"pass_id": _clip(pass_id, 40), "destinations": _clip(destinations, 300),
-  #         "start_date": _clip(start_date, 10), "line_ref": _clip(line_ref, 40),
-  #         "confirmed": True if confirmed is True else None}
-  # return await call_gateway("buyPass", "POST", "/roaming/purchases", tool_context, body=body)
-  return post_disabled()
+  body = {"pass_id": _clip(pass_id, 40), "destinations": _clip(destinations, 300),
+          "start_date": _clip(start_date, 10), "line_ref": _clip(line_ref, 40),
+          "confirmed": True if confirmed is True else None}
+  return await call_gateway("buyPass", "POST", "/roaming/purchases", tool_context, body=body)
 
 
 @safe_tool
@@ -124,11 +122,9 @@ async def helpWithWrongPass(  # noqa: N802
     pass_ref: pass_ref from listMyPasses.
     line_ref: The line, from listRoamingLines. Leave out for the caller's own line.
   """
-  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
-  # body = {"pass_ref": _clip(pass_ref, 40), "line_ref": _clip(line_ref, 40)}
-  # return await call_gateway("helpWithWrongPass", "POST", "/roaming/wrong-pass", tool_context,
-  #                           body=body)
-  return post_disabled()
+  body = {"pass_ref": _clip(pass_ref, 40), "line_ref": _clip(line_ref, 40)}
+  return await call_gateway("helpWithWrongPass", "POST", "/roaming/wrong-pass", tool_context,
+                            body=body)
 
 
 @safe_tool
@@ -152,12 +148,10 @@ async def switchRoaming(  # noqa: N802
     acknowledged_active_pass: True when the caller heard the warning about their
       passes and still wants roaming off.
   """
-  # TEMPORARY: POST disabled while testing on the PROD gateway (real lines).
-  # body = {"turn": turn, "line_ref": _clip(line_ref, 40),
-  #         "confirmed": True if confirmed is True else None,
-  #         "acknowledged_active_pass": True if acknowledged_active_pass is True else None}
-  # return await call_gateway("switchRoaming", "POST", "/roaming/switch", tool_context, body=body)
-  return post_disabled()
+  body = {"turn": turn, "line_ref": _clip(line_ref, 40),
+          "confirmed": True if confirmed is True else None,
+          "acknowledged_active_pass": True if acknowledged_active_pass is True else None}
+  return await call_gateway("switchRoaming", "POST", "/roaming/switch", tool_context, body=body)
 
 
 ROAMING_TOOLS = [listRoamingLines, findPasses, buyPass, listMyPasses, helpWithWrongPass,
