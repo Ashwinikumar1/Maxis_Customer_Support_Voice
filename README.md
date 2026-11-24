@@ -6,7 +6,7 @@ takes phone calls through **Genesys**. Runs as one container on **Cloud Run**.
 
 | Area | Status |
 |---|---|
-| ADK agent: FAQ, roaming flow, Maxis gateway | ✅ Working (staging gateway; write actions disabled until approved). Greeting ~2 s |
+| ADK agent: FAQ, roaming flow, Maxis gateway | ✅ Working (read + write gateway tools enabled). Greeting ~2 s |
 | Escalation to a human agent | ⚠️ Placeholder code only, **not working yet**: deferred until the Genesys integration works |
 | Genesys telephony (`/ces` bridge) | 🟢 Works end to end locally with the real `ces-genesys-adapter` code ([voice_agent_client/adapter_test](voice_agent_client/adapter_test/README.md)); [rollout plan](Documents/Genesys_Adapter_Rollout.md) waiting on Maxis |
 | Cloud Run in Maxis project (`asia-southeast1`) | 🟢 Deployed (`ces-genesys-adapter-adk-stg` + `maxis-voice-agent` in Singapore); pending dedicated SAs, org policy tag, and Cloud Armor LB |
@@ -36,7 +36,7 @@ phone audio, same token). So moving from testing to real phone calls changes not
 | Agent | Does | Tools |
 |---|---|---|
 | `maxis_agent` (orchestrator) | Answers Maxis questions from the FAQ first; hands "my line" requests to a specialist | `VertexAiSearchTool` (FAQ) |
-| `roaming_agent` | Roaming on the caller's line | `listRoamingLines`, `findPasses`, `listMyPasses` (live); `buyPass`, `switchRoaming`, `helpWithWrongPass`, `sendWhatsAppLink` (disabled until approved); `escalateToAgent` (placeholder) |
+| `roaming_agent` | Roaming on the caller's line | `listRoamingLines`, `findPasses`, `listMyPasses`, `buyPass`, `switchRoaming`, `helpWithWrongPass`, `sendWhatsAppLink` (live); `escalateToAgent` (placeholder) |
 
 **How it behaves**
 - English and Malay only. Other languages get a fixed bilingual refusal.

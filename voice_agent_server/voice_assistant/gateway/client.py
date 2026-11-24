@@ -29,9 +29,7 @@ from .safe_tool import internal_error
 
 logger = logging.getLogger("voice_agent.gateway")
 
-# TEMPORARY: GET only while testing on the PROD gateway (real lines). Restore
-# {"GET", "POST"} together with the commented-out POST tool calls.
-_ALLOWED_METHODS = {"GET"}
+_ALLOWED_METHODS = {"GET", "POST"}
 # Digits only (E.164 without "+"): also blocks header injection.
 MSISDN_RE = re.compile(r"[0-9]{8,15}")
 CONVERSATION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
